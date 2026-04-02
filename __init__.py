@@ -85,17 +85,20 @@ except ImportError:
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
     from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
+    from .int8_kernel_config_node import INT8KernelConfigTuner
     
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
         "INT8LoraLoader": INT8LoraLoader,
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
+        "INT8KernelConfigTuner": INT8KernelConfigTuner,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
         "INT8LoraLoader": "Load LoRA INT8",
         "INT8LoraLoaderStack": "Load LoRA Stack INT8",
+        "INT8KernelConfigTuner": "INT8 Kernel Config",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")

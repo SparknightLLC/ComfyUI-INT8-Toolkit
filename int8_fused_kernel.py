@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 
 # =============================================================================
@@ -40,6 +41,160 @@ _AUTOTUNE_CONFIGS = [
 	triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
 	triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
 ]
+
+_KERNEL_CONFIG_KEYS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_SIZE_M", "num_warps", "num_stages")
+
+
+def _sanitize_kernel_config(config: dict) -> dict:
+	return {
+		"BLOCK_M": max(16, int(config["BLOCK_M"])),
+		"BLOCK_N": max(16, int(config["BLOCK_N"])),
+		"BLOCK_K": max(16, int(config["BLOCK_K"])),
+		"GROUP_SIZE_M": max(1, int(config["GROUP_SIZE_M"])),
+		"num_warps": max(1, int(config["num_warps"])),
+		"num_stages": max(1, int(config["num_stages"])),
+	}
+
+
+def get_fixed_kernel_config() -> dict:
+	return dict(_FIXED_KERNEL_CONFIG)
+
+
+def is_fixed_kernel_mode() -> bool:
+	return not _ENABLE_TRITON_AUTOTUNE
+
+
+def set_fixed_kernel_config(config: dict, source: str = "runtime", silent: bool = False) -> dict:
+	global _FIXED_KERNEL_CONFIG
+	try:
+		merged = dict(_FIXED_KERNEL_CONFIG)
+		for key in _KERNEL_CONFIG_KEYS:
+			if key in config:
+				merged[key] = config[key]
+		_FIXED_KERNEL_CONFIG = _sanitize_kernel_config(merged)
+		if not silent:
+			print(f"[ComfyUI-Flux2-INT8] Applied INT8 Triton config from {source}: {_FIXED_KERNEL_CONFIG}")
+	except Exception as e:
+		if not silent:
+			print(f"[ComfyUI-Flux2-INT8] Failed to apply kernel config from {source}: {e}")
+	return dict(_FIXED_KERNEL_CONFIG)
+
+
+def format_kernel_config_env_lines(config: dict) -> list[str]:
+	cfg = _sanitize_kernel_config(config)
+	return [
+		f"INT8_TRITON_BLOCK_M={cfg['BLOCK_M']}",
+		f"INT8_TRITON_BLOCK_N={cfg['BLOCK_N']}",
+		f"INT8_TRITON_BLOCK_K={cfg['BLOCK_K']}",
+		f"INT8_TRITON_GROUP_SIZE_M={cfg['GROUP_SIZE_M']}",
+		f"INT8_TRITON_NUM_WARPS={cfg['num_warps']}",
+		f"INT8_TRITON_NUM_STAGES={cfg['num_stages']}",
+	]
+
+
+def get_candidate_kernel_configs(extra_candidates: list[dict] | None = None, include_current: bool = True) -> list[dict]:
+	candidates = []
+	seen = set()
+
+	def _add(cfg):
+		try:
+			sanitized = _sanitize_kernel_config(cfg)
+		except Exception:
+			return
+		fingerprint = tuple(sanitized[key] for key in _KERNEL_CONFIG_KEYS)
+		if fingerprint in seen:
+			return
+		seen.add(fingerprint)
+		candidates.append(sanitized)
+
+	if include_current:
+		_add(_FIXED_KERNEL_CONFIG)
+
+	for cfg in _AUTOTUNE_CONFIGS:
+		kwargs = getattr(cfg, "kwargs", None)
+		if kwargs is None:
+			continue
+		_add({
+			"BLOCK_M": kwargs.get("BLOCK_M", _FIXED_KERNEL_CONFIG["BLOCK_M"]),
+			"BLOCK_N": kwargs.get("BLOCK_N", _FIXED_KERNEL_CONFIG["BLOCK_N"]),
+			"BLOCK_K": kwargs.get("BLOCK_K", _FIXED_KERNEL_CONFIG["BLOCK_K"]),
+			"GROUP_SIZE_M": kwargs.get("GROUP_SIZE_M", _FIXED_KERNEL_CONFIG["GROUP_SIZE_M"]),
+			"num_warps": getattr(cfg, "num_warps", _FIXED_KERNEL_CONFIG["num_warps"]),
+			"num_stages": getattr(cfg, "num_stages", _FIXED_KERNEL_CONFIG["num_stages"]),
+		})
+
+	if extra_candidates:
+		for cfg in extra_candidates:
+			if isinstance(cfg, dict):
+				_add(cfg)
+
+	return candidates
+
+
+@torch.no_grad()
+def microbench_fixed_kernel_configs(
+	m: int = 2048,
+	k: int = 4096,
+	n: int = 4096,
+	warmup: int = 2,
+	iterations: int = 6,
+	include_scalar: bool = False,
+	extra_candidates: list[dict] | None = None,
+):
+	if not is_fixed_kernel_mode():
+		raise RuntimeError("INT8_TRITON_AUTOTUNE=1 is active; fixed kernel config microbench is unavailable.")
+
+	if not torch.cuda.is_available():
+		raise RuntimeError("CUDA is required for Triton kernel microbench.")
+
+	m = max(64, int(m))
+	k = max(64, int(k))
+	n = max(64, int(n))
+	warmup = max(1, int(warmup))
+	iterations = max(2, int(iterations))
+
+	original_config = get_fixed_kernel_config()
+	candidates = get_candidate_kernel_configs(extra_candidates=extra_candidates, include_current=True)
+	if not candidates:
+		raise RuntimeError("No Triton kernel configs available for benchmarking.")
+
+	device = torch.device("cuda")
+	x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+	weight = torch.randint(-128, 128, (n, k), device=device, dtype=torch.int8)
+	w_scale_row = torch.rand((n, 1), device=device, dtype=torch.float32).mul_(0.02).add_(0.005)
+	w_scale_scalar = torch.tensor([0.01], device=device, dtype=torch.float32)
+	bias = torch.randn((n,), device=device, dtype=torch.float32)
+
+	results = []
+	try:
+		for cfg in candidates:
+			set_fixed_kernel_config(cfg, source="microbench", silent=True)
+
+			for _ in range(warmup):
+				_ = triton_int8_linear_per_row(x, weight, w_scale_row, bias=bias, compute_dtype=torch.bfloat16)
+				if include_scalar:
+					_ = triton_int8_linear(x, weight, w_scale_scalar, bias=bias, compute_dtype=torch.bfloat16)
+			torch.cuda.synchronize()
+
+			start = time.perf_counter()
+			for _ in range(iterations):
+				_ = triton_int8_linear_per_row(x, weight, w_scale_row, bias=bias, compute_dtype=torch.bfloat16)
+				if include_scalar:
+					_ = triton_int8_linear(x, weight, w_scale_scalar, bias=bias, compute_dtype=torch.bfloat16)
+			torch.cuda.synchronize()
+
+			elapsed_ms = (time.perf_counter() - start) * 1000.0
+			avg_ms = elapsed_ms / iterations
+			results.append({
+				"config": dict(cfg),
+				"avg_ms": avg_ms,
+			})
+	finally:
+		set_fixed_kernel_config(original_config, source="restore", silent=True)
+
+	results.sort(key=lambda item: item["avg_ms"])
+	best = results[0]["config"]
+	return best, results
 
 if _ENABLE_TRITON_AUTOTUNE:
 	print("[ComfyUI-Flux2-INT8] Triton autotune is enabled (INT8_TRITON_AUTOTUNE=1).")

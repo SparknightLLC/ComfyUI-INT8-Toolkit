@@ -57,6 +57,12 @@ Per-row INT8 weight-scale inference support (upstream PR #24 scope) is integrate
 
 This fork includes runtime kernel configuration knobs for fixed vs autotuned Triton launch behavior:
 
+You can set these via environment variables, or use the `INT8 Kernel Config` node to:
+
+- Apply manual fixed-kernel values in-graph.
+- Optionally run an on-demand microbench and auto-select the best fixed config.
+- Print the recommended env var values to console for future reuse.
+
 - `INT8_TRITON_AUTOTUNE`
 - `INT8_TRITON_BLOCK_M`
 - `INT8_TRITON_BLOCK_N`
@@ -68,7 +74,11 @@ This fork includes runtime kernel configuration knobs for fixed vs autotuned Tri
 Additional runtime toggles:
 
 - `INT8_SMALL_BATCH_FALLBACK_MAX_ROWS`
+- `INT8_SMALL_BATCH_FALLBACK_MIN_ROWS`
+- `INT8_SMALL_BATCH_FALLBACK_ADAPTIVE`
 - `INT8_DYNAMIC_LORA_DEBUG`
+- `INT8_DYNAMIC_LORA_BATCH`
+- `INT8_DYNAMIC_LORA_BATCH_MAX_RANK`
 
 ## Node Summary
 
@@ -90,6 +100,12 @@ Loads one LoRA with selectable `mode`:
 Loads up to 10 LoRAs with the same selectable `mode` behavior as above.
 
 Node display name: `Load LoRA Stack INT8`.
+
+### INT8 Kernel Config
+
+Utility node that applies a fixed Triton kernel config at runtime.
+
+Optional microbench mode runs on demand, selects the fastest fixed config from built-in candidates plus your manual values, and prints env vars to console so you can persist them.
 
 ## ModelSave Round-Trip
 

@@ -25,7 +25,19 @@ try:
 except ValueError:
     _SMALL_BATCH_FALLBACK_MAX_ROWS = 16
 
+try:
+    _SMALL_BATCH_FALLBACK_MIN_ROWS = max(1, int(os.environ.get("INT8_SMALL_BATCH_FALLBACK_MIN_ROWS", "2")))
+except ValueError:
+    _SMALL_BATCH_FALLBACK_MIN_ROWS = 2
+
+_ADAPTIVE_SMALL_BATCH_FALLBACK = os.environ.get("INT8_SMALL_BATCH_FALLBACK_ADAPTIVE", "1") == "1"
 _DYNAMIC_LORA_DEBUG = os.environ.get("INT8_DYNAMIC_LORA_DEBUG", "0") == "1"
+_DYNAMIC_LORA_BATCH = os.environ.get("INT8_DYNAMIC_LORA_BATCH", "1") == "1"
+
+try:
+    _DYNAMIC_LORA_BATCH_MAX_RANK = max(64, int(os.environ.get("INT8_DYNAMIC_LORA_BATCH_MAX_RANK", "4096")))
+except ValueError:
+    _DYNAMIC_LORA_BATCH_MAX_RANK = 4096
 
 _FLOAT8_DTYPES = tuple(
     dtype for dtype in (
@@ -157,6 +169,119 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
         res_scaled = res_scaled + bias.to(compute_dtype)
     return res_scaled
 
+def _normalize_dynamic_offset(offset):
+    if offset is None:
+        return None
+    if not isinstance(offset, (tuple, list)) or len(offset) < 3:
+        return None
+    try:
+        return int(offset[0]), int(offset[1]), int(offset[2])
+    except Exception:
+        return None
+
+def _resolve_dynamic_entry_tensors(entry, device: torch.device):
+    entry_A = entry.get("A")
+    entry_B = entry.get("B")
+    if entry_A is None or entry_B is None:
+        return None, None
+
+    lA = entry.get("_A_cached")
+    lB = entry.get("_B_cached")
+
+    if lA is None or lA.device != device:
+        lA = entry_A if entry_A.device == device else entry_A.to(device, non_blocking=True)
+        entry["_A_cached"] = lA
+    if lB is None or lB.device != device:
+        lB = entry_B if entry_B.device == device else entry_B.to(device, non_blocking=True)
+        entry["_B_cached"] = lB
+
+    return lA, lB
+
+def _can_batch_dynamic_entries(prepared_entries, output_length: int | None):
+    if not _DYNAMIC_LORA_BATCH or len(prepared_entries) < 2:
+        return False
+
+    rank_total = 0
+    input_width = None
+    output_width = None
+    a_dtype = None
+    b_dtype = None
+
+    for _, lA, lB in prepared_entries:
+        if not isinstance(lA, torch.Tensor) or not isinstance(lB, torch.Tensor):
+            return False
+        if lA.ndim != 2 or lB.ndim != 2:
+            return False
+        if lB.shape[1] != lA.shape[0]:
+            return False
+
+        if input_width is None:
+            input_width = lA.shape[1]
+        elif input_width != lA.shape[1]:
+            return False
+
+        if output_width is None:
+            output_width = lB.shape[0]
+        elif output_width != lB.shape[0]:
+            return False
+
+        if a_dtype is None:
+            a_dtype = lA.dtype
+        elif a_dtype != lA.dtype:
+            return False
+
+        if b_dtype is None:
+            b_dtype = lB.dtype
+        elif b_dtype != lB.dtype:
+            return False
+
+        rank_total += int(lA.shape[0])
+        if rank_total > _DYNAMIC_LORA_BATCH_MAX_RANK:
+            return False
+
+    if output_length is not None and output_width is not None and output_width != output_length:
+        return False
+
+    return True
+
+def _get_small_batch_fallback_threshold(linear_module) -> int:
+    base_rows = _SMALL_BATCH_FALLBACK_MAX_ROWS
+    if base_rows <= 0:
+        return 0
+
+    if not _ADAPTIVE_SMALL_BATCH_FALLBACK:
+        return base_rows
+
+    weight = getattr(linear_module, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.ndim < 2:
+        return base_rows
+
+    out_features = int(weight.shape[0])
+    in_features = int(weight.shape[1])
+    matmul_size = out_features * in_features
+
+    rows = base_rows
+    if matmul_size >= 12_000_000:
+        rows = min(rows, 6)
+    elif matmul_size >= 8_000_000:
+        rows = min(rows, 8)
+    elif matmul_size >= 4_000_000:
+        rows = min(rows, 12)
+    elif matmul_size <= 1_000_000:
+        rows = min(32, max(rows, base_rows + 6))
+
+    if getattr(linear_module, "_is_per_row", False):
+        rows = max(_SMALL_BATCH_FALLBACK_MIN_ROWS, rows - 2)
+
+    dynamic_entries = getattr(linear_module, "dynamic_lora_entries", None)
+    dynamic_count = len(dynamic_entries) if dynamic_entries else 0
+    if dynamic_count >= 4:
+        rows = max(_SMALL_BATCH_FALLBACK_MIN_ROWS, rows - 4)
+    elif dynamic_count >= 2:
+        rows = max(_SMALL_BATCH_FALLBACK_MIN_ROWS, rows - 2)
+
+    return max(_SMALL_BATCH_FALLBACK_MIN_ROWS, rows)
+
 @torch.no_grad()
 @_disable_torch_compile
 def apply_dynamic_lora_delta(
@@ -169,63 +294,92 @@ def apply_dynamic_lora_delta(
     device: torch.device,
 ) -> Tensor:
     if lora_entries:
+        grouped_entries = {}
         for entry in lora_entries:
-            entry_A = entry.get("A")
-            entry_B = entry.get("B")
-            offset = entry.get("offset")
-            if entry_A is None or entry_B is None:
-                continue
+            offset_key = _normalize_dynamic_offset(entry.get("offset"))
+            grouped_entries.setdefault(offset_key, []).append(entry)
 
-            # Cache per-device tensors to avoid repeated CPU->GPU copies every forward.
-            lA = entry.get("_A_cached")
-            lB = entry.get("_B_cached")
-            if lA is None or lA.device != device:
-                lA = entry_A if entry_A.device == device else entry_A.to(device, non_blocking=True)
-                entry["_A_cached"] = lA
-            if lB is None or lB.device != device:
-                lB = entry_B if entry_B.device == device else entry_B.to(device, non_blocking=True)
-                entry["_B_cached"] = lB
+        for offset_key, entries in grouped_entries.items():
+            dim = None
+            start = None
+            length = None
             x_src = x_2d
 
-            if offset is not None and len(offset) >= 3 and int(offset[0]) == 1:
-                start = int(offset[1])
-                length = int(offset[2])
-                if start >= 0 and length > 0 and (start + length) <= x_2d.shape[-1]:
+            if offset_key is not None:
+                dim, start, length = offset_key
+                if dim == 1:
+                    if not (start >= 0 and length > 0 and (start + length) <= x_2d.shape[-1]):
+                        if _DYNAMIC_LORA_DEBUG:
+                            print(
+                                f"[INT8 Dynamic LoRA] skipping invalid input offset={offset_key} "
+                                f"for x shape={tuple(x_2d.shape)}"
+                            )
+                        continue
                     x_src = x_2d.narrow(-1, start, length)
-                else:
-                    if _DYNAMIC_LORA_DEBUG:
-                        print(f"[INT8 Dynamic LoRA] skipping invalid input offset={offset} for x shape={tuple(x_2d.shape)}")
-                    continue
+                elif dim == 0:
+                    if not (start >= 0 and length > 0 and (start + length) <= y.shape[-1]):
+                        if _DYNAMIC_LORA_DEBUG:
+                            print(
+                                f"[INT8 Dynamic LoRA] skipping invalid output offset={offset_key} "
+                                f"for y shape={tuple(y.shape)}"
+                            )
+                        continue
 
-            lora_x = F.linear(x_src.to(lA.dtype), lA)
-            lora_y = F.linear(lora_x, lB).to(y.dtype)
-
-            if offset is not None and len(offset) >= 3 and int(offset[0]) == 0:
-                start = int(offset[1])
-                length = int(offset[2])
-                if lora_y.shape[-1] != length:
-                    if _DYNAMIC_LORA_DEBUG:
-                        print(
-                            f"[INT8 Dynamic LoRA] skipping mismatched output slice "
-                            f"offset={offset} lora_y={tuple(lora_y.shape)} y={tuple(y.shape)}"
-                        )
+            prepared_entries = []
+            for entry in entries:
+                lA, lB = _resolve_dynamic_entry_tensors(entry, device)
+                if lA is None or lB is None:
                     continue
-                if start >= 0 and length > 0 and (start + length) <= y.shape[-1]:
+                prepared_entries.append((entry, lA, lB))
+
+            if not prepared_entries:
+                continue
+
+            output_length = length if dim == 0 else None
+            batched = _can_batch_dynamic_entries(prepared_entries, output_length)
+            if batched:
+                cat_A = torch.cat([lA for _, lA, _ in prepared_entries], dim=0)
+                cat_B = torch.cat([lB for _, _, lB in prepared_entries], dim=1)
+                lora_x = F.linear(x_src.to(cat_A.dtype), cat_A)
+                lora_y = F.linear(lora_x, cat_B).to(y.dtype)
+
+                if dim == 0:
                     y.narrow(-1, start, length).add_(lora_y)
                 else:
+                    if lora_y.shape[-1] != y.shape[-1]:
+                        if _DYNAMIC_LORA_DEBUG:
+                            print(
+                                f"[INT8 Dynamic LoRA] skipping mismatched batched add "
+                                f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset_key}"
+                            )
+                        continue
+                    y.add_(lora_y)
+                continue
+
+            for _, lA, lB in prepared_entries:
+                lora_x = F.linear(x_src.to(lA.dtype), lA)
+                lora_y = F.linear(lora_x, lB).to(y.dtype)
+
+                if dim == 0:
+                    if lora_y.shape[-1] != length:
+                        if _DYNAMIC_LORA_DEBUG:
+                            print(
+                                f"[INT8 Dynamic LoRA] skipping mismatched output slice "
+                                f"offset={offset_key} lora_y={tuple(lora_y.shape)} y={tuple(y.shape)}"
+                            )
+                        continue
+                    y.narrow(-1, start, length).add_(lora_y)
+                    continue
+
+                if lora_y.shape[-1] != y.shape[-1]:
                     if _DYNAMIC_LORA_DEBUG:
-                        print(f"[INT8 Dynamic LoRA] skipping invalid output offset={offset} for y shape={tuple(y.shape)}")
-                continue
+                        print(
+                            f"[INT8 Dynamic LoRA] skipping mismatched full add "
+                            f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset_key}"
+                        )
+                    continue
 
-            if lora_y.shape[-1] != y.shape[-1]:
-                if _DYNAMIC_LORA_DEBUG:
-                    print(
-                        f"[INT8 Dynamic LoRA] skipping mismatched full add "
-                        f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset}"
-                    )
-                continue
-
-            y.add_(lora_y)
+                y.add_(lora_y)
 
         return y
 
@@ -1002,7 +1156,8 @@ if _COMFY_OPS_AVAILABLE:
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
-                use_small_batch_fallback = _SMALL_BATCH_FALLBACK_MAX_ROWS > 0 and x_2d.shape[0] <= _SMALL_BATCH_FALLBACK_MAX_ROWS
+                small_batch_threshold = _get_small_batch_fallback_threshold(self)
+                use_small_batch_fallback = small_batch_threshold > 0 and x_2d.shape[0] <= small_batch_threshold
                 if use_small_batch_fallback:
                     # Small batch fallback
                     w_float = dequantize(weight, w_scale).to(x.dtype)
