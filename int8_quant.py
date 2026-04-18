@@ -51,8 +51,14 @@ except ValueError:
 _ADAPTIVE_SMALL_BATCH_FALLBACK = os.environ.get("INT8_SMALL_BATCH_FALLBACK_ADAPTIVE", "1") == "1"
 _DYNAMIC_LORA_DEBUG = os.environ.get("INT8_DYNAMIC_LORA_DEBUG", "0") == "1"
 _DYNAMIC_LORA_BATCH = os.environ.get("INT8_DYNAMIC_LORA_BATCH", "1") == "1"
+OUTLIER_METHOD_NONE = "none"
+OUTLIER_METHOD_QUAROT = "quarot"
+OUTLIER_METHOD_HADANORM = "hadanorm"
+OUTLIER_METHOD_CHOICES = [OUTLIER_METHOD_NONE, OUTLIER_METHOD_QUAROT, OUTLIER_METHOD_HADANORM]
 _QUAROT_GROUP_SIZE = 128
 _QUAROT_OFFSET_WARNED: set[tuple[int, int, int] | str] = set()
+_HADANORM_ALPHA = 0.5
+_HADANORM_EPS = 1e-6
 
 try:
     _DYNAMIC_LORA_BATCH_MAX_RANK = max(64, int(os.environ.get("INT8_DYNAMIC_LORA_BATCH_MAX_RANK", "4096")))
@@ -81,6 +87,33 @@ def _get_int8_compute_device(fallback_device: torch.device | None = None) -> tor
 
 def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return dtype in _FLOAT8_DTYPES
+
+def _normalize_outlier_method(method) -> str:
+    if not isinstance(method, str):
+        return OUTLIER_METHOD_NONE
+
+    normalized = method.strip().lower()
+    if normalized in OUTLIER_METHOD_CHOICES:
+        return normalized
+    return OUTLIER_METHOD_NONE
+
+def _get_module_outlier_method(module) -> str:
+    method = _normalize_outlier_method(getattr(module, "_outlier_method", None))
+    if method != OUTLIER_METHOD_NONE:
+        return method
+    if bool(getattr(module, "_use_quarot", False)):
+        return OUTLIER_METHOD_QUAROT
+    return OUTLIER_METHOD_NONE
+
+def _outlier_method_uses_hadamard(method) -> bool:
+    normalized = _normalize_outlier_method(method)
+    return normalized in (OUTLIER_METHOD_QUAROT, OUTLIER_METHOD_HADANORM)
+
+def _compute_hadanorm_sigma(weight: Tensor) -> Tensor:
+    weight_f = weight.float()
+    channel_max = weight_f.abs().amax(dim=0)
+    sigma = channel_max.clamp(min=_HADANORM_EPS).pow(-(1.0 - _HADANORM_ALPHA))
+    return sigma.clamp(min=_HADANORM_EPS)
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
     return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
@@ -331,13 +364,14 @@ def _get_small_batch_fallback_threshold(linear_module) -> int:
 @torch.no_grad()
 @_disable_torch_compile
 def apply_dynamic_lora_delta(
-    x_2d: Tensor,
+    x_input: Tensor,
     y: Tensor,
     lora_A: Tensor | None,
     lora_B: Tensor | None,
     lora_alpha,
     lora_entries,
     device: torch.device,
+    correction_x: Tensor | None = None,
 ) -> Tensor:
     if lora_entries:
         grouped_entries = {}
@@ -349,19 +383,22 @@ def apply_dynamic_lora_delta(
             dim = None
             start = None
             length = None
-            x_src = x_2d
+            x_src = x_input
+            correction_src = correction_x
 
             if offset_key is not None:
                 dim, start, length = offset_key
                 if dim == 1:
-                    if not (start >= 0 and length > 0 and (start + length) <= x_2d.shape[-1]):
+                    if not (start >= 0 and length > 0 and (start + length) <= x_input.shape[-1]):
                         if _DYNAMIC_LORA_DEBUG:
                             print(
                                 f"[INT8 Dynamic LoRA] skipping invalid input offset={offset_key} "
-                                f"for x shape={tuple(x_2d.shape)}"
+                                f"for x shape={tuple(x_input.shape)}"
                             )
                         continue
-                    x_src = x_2d.narrow(-1, start, length)
+                    x_src = x_input.narrow(-1, start, length)
+                    if correction_x is not None:
+                        correction_src = correction_x.narrow(-1, start, length)
                 elif dim == 0:
                     if not (start >= 0 and length > 0 and (start + length) <= y.shape[-1]):
                         if _DYNAMIC_LORA_DEBUG:
@@ -388,9 +425,15 @@ def apply_dynamic_lora_delta(
                 cat_B = torch.cat([lB for _, _, lB in prepared_entries], dim=1)
                 lora_x = F.linear(x_src.to(cat_A.dtype), cat_A)
                 lora_y = F.linear(lora_x, cat_B).to(y.dtype)
+                correction_y = None
+                if correction_src is not None:
+                    correction_proj = F.linear(correction_src.to(cat_A.dtype), cat_A)
+                    correction_y = F.linear(correction_proj, cat_B).to(y.dtype)
 
                 if dim == 0:
                     y.narrow(-1, start, length).add_(lora_y)
+                    if correction_y is not None:
+                        y.narrow(-1, start, length).add_(correction_y)
                 else:
                     if lora_y.shape[-1] != y.shape[-1]:
                         if _DYNAMIC_LORA_DEBUG:
@@ -400,11 +443,17 @@ def apply_dynamic_lora_delta(
                             )
                         continue
                     y.add_(lora_y)
+                    if correction_y is not None:
+                        y.add_(correction_y)
                 continue
 
             for _, lA, lB in prepared_entries:
                 lora_x = F.linear(x_src.to(lA.dtype), lA)
                 lora_y = F.linear(lora_x, lB).to(y.dtype)
+                correction_y = None
+                if correction_src is not None:
+                    correction_proj = F.linear(correction_src.to(lA.dtype), lA)
+                    correction_y = F.linear(correction_proj, lB).to(y.dtype)
 
                 if dim == 0:
                     if lora_y.shape[-1] != length:
@@ -415,6 +464,8 @@ def apply_dynamic_lora_delta(
                             )
                         continue
                     y.narrow(-1, start, length).add_(lora_y)
+                    if correction_y is not None:
+                        y.narrow(-1, start, length).add_(correction_y)
                     continue
 
                 if lora_y.shape[-1] != y.shape[-1]:
@@ -426,6 +477,8 @@ def apply_dynamic_lora_delta(
                     continue
 
                 y.add_(lora_y)
+                if correction_y is not None:
+                    y.add_(correction_y)
 
         return y
 
@@ -435,13 +488,21 @@ def apply_dynamic_lora_delta(
     lA = lora_A if lora_A.device == device else lora_A.to(device, non_blocking=True)
     lB = lora_B if lora_B.device == device else lora_B.to(device, non_blocking=True)
 
-    lora_x = F.linear(x_2d.to(lA.dtype), lA)
+    lora_x = F.linear(x_input.to(lA.dtype), lA)
     lora_y = F.linear(lora_x, lB)
 
     if lora_alpha is not None:
         lora_y = lora_y * lora_alpha
 
-    return y + lora_y.to(y.dtype)
+    output = y + lora_y.to(y.dtype)
+    if correction_x is not None:
+        correction_proj = F.linear(correction_x.to(lA.dtype), lA)
+        correction_y = F.linear(correction_proj, lB)
+        if lora_alpha is not None:
+            correction_y = correction_y * lora_alpha
+        output = output + correction_y.to(y.dtype)
+
+    return output
 
 
 
@@ -562,7 +623,32 @@ def _get_effective_weight_scale(weight_scale, row_count, offset=None):
     # Fall back to scalar mean to avoid shape/device crashes.
     return weight_scale.float().mean()
 
-def _quarot_offset_supported(offset, input_width: int, group_size: int) -> bool:
+def _get_effective_hadanorm_sigma(hadanorm_sigma, input_width, offset=None):
+    if not isinstance(hadanorm_sigma, torch.Tensor):
+        return None
+
+    if hadanorm_sigma.numel() == input_width:
+        return hadanorm_sigma
+
+    normalized = _normalize_dynamic_offset(offset)
+    if normalized is None:
+        return None
+
+    dim, start, size = normalized
+    if dim != 1 or size != input_width:
+        return None
+    if start < 0 or (start + size) > hadanorm_sigma.numel():
+        return None
+    return hadanorm_sigma.narrow(0, start, size)
+
+def _rotate_activation_runtime(x: Tensor, h_matrix: Tensor, group_size: int) -> Tensor:
+    original_shape = x.shape
+    feature_count = original_shape[-1]
+    group_count = feature_count // group_size
+    grouped_x = x.reshape(*original_shape[:-1], group_count, group_size)
+    return torch.matmul(grouped_x, h_matrix).reshape(original_shape)
+
+def _hadamard_offset_supported(offset, input_width: int, group_size: int) -> bool:
     normalized = _normalize_dynamic_offset(offset)
     if normalized is None:
         return True
@@ -581,37 +667,85 @@ def _quarot_offset_supported(offset, input_width: int, group_size: int) -> bool:
         return False
     return True
 
-def _rotate_delta_for_quarot_if_needed(
-    delta_f: Tensor,
-    use_quarot: bool,
+def _transform_weight_like_for_outlier_method(
+    weight_like: Tensor,
+    outlier_method,
     comp_device: torch.device,
+    hadanorm_sigma: Tensor | None = None,
     offset=None,
 ) -> Tensor:
-    if not use_quarot:
-        return delta_f
-    if delta_f.ndim < 2 or delta_f.shape[1] % _QUAROT_GROUP_SIZE != 0:
-        return delta_f
-    if not _quarot_offset_supported(offset, delta_f.shape[1], _QUAROT_GROUP_SIZE):
+    method = _normalize_outlier_method(outlier_method)
+    if method == OUTLIER_METHOD_NONE:
+        return weight_like
+    if weight_like.ndim < 2 or weight_like.shape[1] % _QUAROT_GROUP_SIZE != 0:
+        return weight_like
+    if not _outlier_method_uses_hadamard(method):
+        return weight_like
+    if not _hadamard_offset_supported(offset, weight_like.shape[1], _QUAROT_GROUP_SIZE):
         normalized = _normalize_dynamic_offset(offset)
         key = normalized if normalized is not None else "unsupported_offset"
         if key not in _QUAROT_OFFSET_WARNED:
             _QUAROT_OFFSET_WARNED.add(key)
             logging.warning(
-                f"[INT8 QuaRot] skipping rotation for unsupported offset={normalized} "
-                f"delta_shape={tuple(delta_f.shape)}"
+                f"[INT8 {method}] skipping transform for unsupported offset={normalized} "
+                f"weight_shape={tuple(weight_like.shape)}"
             )
-        return delta_f
+        return weight_like
 
     try:
         if not _QUAROT_AVAILABLE:
-            return delta_f
-        rotate_dtype = torch.float32 if delta_f.dtype in (torch.float16, torch.bfloat16) else delta_f.dtype
-        delta_work = delta_f.to(comp_device, dtype=rotate_dtype)
+            return weight_like
+        rotate_dtype = torch.float32 if weight_like.dtype in (torch.float16, torch.bfloat16) else weight_like.dtype
+        weight_work = weight_like.to(comp_device, dtype=rotate_dtype)
+        if method == OUTLIER_METHOD_HADANORM:
+            sigma = _get_effective_hadanorm_sigma(hadanorm_sigma, weight_like.shape[1], offset=offset)
+            if sigma is None:
+                logging.warning(
+                    f"[INT8 HadaNorm] missing sigma for transformed weight_shape={tuple(weight_like.shape)} "
+                    f"offset={_normalize_dynamic_offset(offset)}"
+                )
+                return weight_like
+            sigma = sigma.to(comp_device, dtype=rotate_dtype, non_blocking=True).view(1, -1)
+            weight_work = weight_work * sigma
         h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=comp_device, dtype=rotate_dtype)
-        rotated = _quarot_rotate_weight(delta_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
-        return rotated.to(delta_f.dtype)
+        rotated = _quarot_rotate_weight(weight_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+        return rotated.to(weight_like.dtype)
     except Exception:
-        return delta_f
+        return weight_like
+
+def _apply_outlier_activation_transform(
+    x: Tensor,
+    outlier_method,
+    hadamard: Tensor | None = None,
+    hadanorm_sigma: Tensor | None = None,
+):
+    method = _normalize_outlier_method(outlier_method)
+    if method == OUTLIER_METHOD_NONE or not isinstance(hadamard, torch.Tensor):
+        return x, None
+    if x.shape[-1] % _QUAROT_GROUP_SIZE != 0:
+        return x, None
+
+    transform_dtype = torch.float32 if x.device.type == "cpu" and x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+    x_work = x.to(transform_dtype) if x.dtype != transform_dtype else x
+
+    if method == OUTLIER_METHOD_HADANORM:
+        if not isinstance(hadanorm_sigma, torch.Tensor):
+            return x, None
+        sigma = hadanorm_sigma
+        if sigma.device != x_work.device or sigma.dtype != x_work.dtype:
+            sigma = sigma.to(x_work.device, dtype=x_work.dtype, non_blocking=True)
+        x_work = x_work / sigma.view(*([1] * (x_work.ndim - 1)), -1)
+
+    h_matrix = hadamard
+    if h_matrix.device != x_work.device or h_matrix.dtype != x_work.dtype:
+        h_matrix = h_matrix.to(x_work.device, dtype=x_work.dtype, non_blocking=True)
+
+    x_rotated = _rotate_activation_runtime(x_work, h_matrix, _QUAROT_GROUP_SIZE)
+    if method == OUTLIER_METHOD_HADANORM:
+        correction_source = x_rotated.mean(dim=-2, keepdim=True)
+        return x_rotated - correction_source, correction_source
+
+    return x_rotated, None
 
 def _apply_int8_delta_inplace(weight, delta_f, weight_scale, seed, offset=None):
     comp_device = _get_int8_compute_device(weight.device)
@@ -646,11 +780,15 @@ if _LORA_ADAPTER_AVAILABLE:
         """
         Specialized LoRA adapter that patches INT8 weights IN-PLACE in INT8 space.
         """
-        def __init__(self, loaded_keys, weights, weight_scale, seed=0, use_quarot=False):
+        def __init__(self, loaded_keys, weights, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
             super().__init__(loaded_keys, weights)
             self.weight_scale = weight_scale
             self.seed = seed
-            self.use_quarot = bool(use_quarot)
+            resolved_method = _normalize_outlier_method(outlier_method)
+            if resolved_method == OUTLIER_METHOD_NONE and use_quarot:
+                resolved_method = OUTLIER_METHOD_QUAROT
+            self.outlier_method = resolved_method
+            self.hadanorm_sigma = hadanorm_sigma
 
         def _calculate_weight_fallback(self, weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype != torch.int8:
@@ -686,7 +824,13 @@ if _LORA_ADAPTER_AVAILABLE:
             del patched_weight_f
             del original_base_f
             del base_weight_f
-            delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+            delta_f = _transform_weight_like_for_outlier_method(
+                delta_f,
+                self.outlier_method,
+                comp_device,
+                hadanorm_sigma=self.hadanorm_sigma,
+                offset=offset,
+            )
             final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
             del delta_f
             return final_weight
@@ -712,7 +856,13 @@ if _LORA_ADAPTER_AVAILABLE:
             if weight.dtype == torch.int8:
                 delta_f = lora_diff * scale
                 del lora_diff
-                delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+                delta_f = _transform_weight_like_for_outlier_method(
+                    delta_f,
+                    self.outlier_method,
+                    comp_device,
+                    hadanorm_sigma=self.hadanorm_sigma,
+                    offset=offset,
+                )
                 final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
                 del delta_f
                 return final_weight
@@ -726,7 +876,7 @@ if _LORA_ADAPTER_AVAILABLE:
         Adapter that merges multiple LoRAs in float space BEFORE applying a single
         stochastic rounding step. This is much more precise for LoRA stacks.
         """
-        def __init__(self, patches, weight_scale, seed=0, use_quarot=False):
+        def __init__(self, patches, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
             # We need to satisfy the base LoRAAdapter constructor.
             # We use the first patch's keys/weights as a reference.
             first_patch_adapter = patches[0][0]
@@ -736,7 +886,11 @@ if _LORA_ADAPTER_AVAILABLE:
             self.patches = patches
             self.weight_scale = weight_scale
             self.seed = seed
-            self.use_quarot = bool(use_quarot)
+            resolved_method = _normalize_outlier_method(outlier_method)
+            if resolved_method == OUTLIER_METHOD_NONE and use_quarot:
+                resolved_method = OUTLIER_METHOD_QUAROT
+            self.outlier_method = resolved_method
+            self.hadanorm_sigma = hadanorm_sigma
 
         def _calculate_weight_fallback(self, weight, key, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype == torch.int8:
@@ -766,7 +920,13 @@ if _LORA_ADAPTER_AVAILABLE:
                 delta_f = patched_weight_f - original_base_f
                 del patched_weight_f
                 del original_base_f
-                delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+                delta_f = _transform_weight_like_for_outlier_method(
+                    delta_f,
+                    self.outlier_method,
+                    comp_device,
+                    hadanorm_sigma=self.hadanorm_sigma,
+                    offset=offset,
+                )
                 final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
                 del delta_f
                 return final_weight
@@ -819,7 +979,13 @@ if _LORA_ADAPTER_AVAILABLE:
 
             if weight.dtype == torch.int8:
                 # One single stochastic rounding step for all combined LoRAs
-                total_delta_f = _rotate_delta_for_quarot_if_needed(total_delta_f, self.use_quarot, comp_device, offset=offset)
+                total_delta_f = _transform_weight_like_for_outlier_method(
+                    total_delta_f,
+                    self.outlier_method,
+                    comp_device,
+                    hadanorm_sigma=self.hadanorm_sigma,
+                    offset=offset,
+                )
                 final_weight = _apply_int8_delta_inplace(weight, total_delta_f, self.weight_scale, self.seed, offset)
                 del total_delta_f
                 return final_weight
@@ -832,11 +998,15 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
     class INT8WeightPatchAdapter(WeightAdapterBase):
         name = "int8_weight_patch"
 
-        def __init__(self, base_adapter, weight_scale, seed=0, use_quarot=False):
+        def __init__(self, base_adapter, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
             self.base_adapter = base_adapter
             self.weight_scale = weight_scale
             self.seed = seed
-            self.use_quarot = bool(use_quarot)
+            resolved_method = _normalize_outlier_method(outlier_method)
+            if resolved_method == OUTLIER_METHOD_NONE and use_quarot:
+                resolved_method = OUTLIER_METHOD_QUAROT
+            self.outlier_method = resolved_method
+            self.hadanorm_sigma = hadanorm_sigma
             self.loaded_keys = getattr(base_adapter, "loaded_keys", set())
             self.weights = getattr(base_adapter, "weights", ())
 
@@ -875,7 +1045,13 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
             del patched_weight_f
             del original_base_f
             del base_weight_f
-            delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+            delta_f = _transform_weight_like_for_outlier_method(
+                delta_f,
+                self.outlier_method,
+                comp_device,
+                hadanorm_sigma=self.hadanorm_sigma,
+                offset=offset,
+            )
             final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
             del delta_f
             return final_weight
@@ -1028,7 +1204,8 @@ class DynamicLoRAHook:
             # Compose
             matched_modules += 1
             entries = []
-            module_use_quarot = bool(getattr(module, "_use_quarot", False))
+            module_outlier_method = _get_module_outlier_method(module)
+            hadanorm_sigma = getattr(module, "hadanorm_sigma", None)
             for adapter, strength, offset in patches:
                 if not _LORA_ADAPTER_AVAILABLE or not isinstance(adapter, LoRAAdapter):
                     if _DYNAMIC_LORA_DEBUG:
@@ -1045,8 +1222,13 @@ class DynamicLoRAHook:
                     continue
 
                 curr_A, curr_B = factors
-                if module_use_quarot and curr_A.ndim == 2 and curr_A.shape[1] % _QUAROT_GROUP_SIZE == 0:
-                    curr_A = _rotate_delta_for_quarot_if_needed(curr_A, True, curr_A.device, offset=offset)
+                curr_A = _transform_weight_like_for_outlier_method(
+                    curr_A,
+                    module_outlier_method,
+                    curr_A.device,
+                    hadanorm_sigma=hadanorm_sigma,
+                    offset=offset,
+                )
 
                 entries.append({
                     "A": curr_A,
@@ -1106,13 +1288,13 @@ if _COMFY_OPS_AVAILABLE:
         """
         excluded_names = []
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
-        enable_quarot = False
+        outlier_method = OUTLIER_METHOD_NONE
         use_triton = True
         _is_prequantized = None # Global flag for current load
         _otf_progress_total = None
         _otf_progress_processed = 0
         _otf_progress_quantized = 0
-        _otf_progress_quarot = 0
+        _otf_progress_outlier = 0
         _otf_progress_last_bucket = -1
 
         @classmethod
@@ -1120,7 +1302,7 @@ if _COMFY_OPS_AVAILABLE:
             cls._otf_progress_total = None
             cls._otf_progress_processed = 0
             cls._otf_progress_quantized = 0
-            cls._otf_progress_quarot = 0
+            cls._otf_progress_outlier = 0
             cls._otf_progress_last_bucket = -1
 
         @classmethod
@@ -1141,13 +1323,13 @@ if _COMFY_OPS_AVAILABLE:
             print(f"[INT8 OTF] Starting quantization scan (estimated layers: {cls._otf_progress_total})")
 
         @classmethod
-        def _update_otf_progress(cls, *, quantized: bool, quarot: bool):
+        def _update_otf_progress(cls, *, quantized: bool, outlier_adjusted: bool):
             total = cls._otf_progress_total if cls._otf_progress_total is not None else 1
             cls._otf_progress_processed += 1
             if quantized:
                 cls._otf_progress_quantized += 1
-            if quarot:
-                cls._otf_progress_quarot += 1
+            if outlier_adjusted:
+                cls._otf_progress_outlier += 1
 
             percent = min(100, int((cls._otf_progress_processed * 100) / max(1, total)))
             bucket = percent // 5
@@ -1157,7 +1339,7 @@ if _COMFY_OPS_AVAILABLE:
                     f"[INT8 OTF] {percent:3d}% "
                     f"({cls._otf_progress_processed}/{total}) "
                     f"quantized={cls._otf_progress_quantized} "
-                    f"quarot={cls._otf_progress_quarot}"
+                    f"outlier_adjusted={cls._otf_progress_outlier}"
                 )
 
         @classmethod
@@ -1168,7 +1350,7 @@ if _COMFY_OPS_AVAILABLE:
                 "[INT8 OTF] Complete "
                 f"(processed={cls._otf_progress_processed}, "
                 f"quantized={cls._otf_progress_quantized}, "
-                f"quarot={cls._otf_progress_quarot})"
+                f"outlier_adjusted={cls._otf_progress_outlier})"
             )
         
         class Linear(manual_cast.Linear):
@@ -1176,9 +1358,11 @@ if _COMFY_OPS_AVAILABLE:
                 super().__init__(*args, **kwargs)
                 self.register_buffer("weight_scale", None)
                 self.register_buffer("quarot_hadamard", None)
+                self.register_buffer("hadanorm_sigma", None)
                 self._is_quantized = False
                 self._is_per_row = False
                 self._use_quarot = False
+                self._outlier_method = OUTLIER_METHOD_NONE
                 self.compute_dtype = torch.bfloat16
                 self.dynamic_lora_entries = None
                 self.lora_A = None
@@ -1192,9 +1376,13 @@ if _COMFY_OPS_AVAILABLE:
                 weight_key = prefix + "weight"
                 scale_key = prefix + "weight_scale"
                 input_scale_key = prefix + "input_scale"
+                hadamard_key = prefix + "quarot_hadamard"
+                hadanorm_sigma_key = prefix + "hadanorm_sigma"
                 bias_key = prefix + "bias"
                 
                 weight_scale = state_dict.pop(scale_key, None)
+                stored_hadamard = state_dict.pop(hadamard_key, None)
+                stored_hadanorm_sigma = state_dict.pop(hadanorm_sigma_key, None)
                 state_dict.pop(prefix + "comfy_quant", None)
                 weight_tensor = state_dict.pop(weight_key, None)
 
@@ -1207,6 +1395,8 @@ if _COMFY_OPS_AVAILABLE:
                         self._is_quantized = True
                         self._use_quarot = False
                         self.quarot_hadamard = None
+                        self.hadanorm_sigma = None
+                        self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
@@ -1223,6 +1413,15 @@ if _COMFY_OPS_AVAILABLE:
                         else:
                             self.weight_scale = torch.tensor([float(weight_scale)], dtype=torch.float32)
                             self._is_per_row = False
+
+                        if isinstance(stored_hadanorm_sigma, torch.Tensor):
+                            self.hadanorm_sigma = stored_hadanorm_sigma.float()
+                            self._outlier_method = OUTLIER_METHOD_HADANORM
+                        if isinstance(stored_hadamard, torch.Tensor):
+                            self.quarot_hadamard = stored_hadamard.float()
+                            if self._outlier_method == OUTLIER_METHOD_NONE:
+                                self._use_quarot = True
+                                self._outlier_method = OUTLIER_METHOD_QUAROT
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight_tensor.dtype):
                         # Load High-Precision
@@ -1251,42 +1450,52 @@ if _COMFY_OPS_AVAILABLE:
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                         quantized_now = False
-                        quarot_now = False
+                        outlier_adjusted_now = False
                         
                         if is_excluded or is_dim1 or Int8TensorwiseOps._is_prequantized or not Int8TensorwiseOps.dynamic_quantize:
                             self._is_quantized = False
                             self._is_per_row = False
                             self._use_quarot = False
                             self.quarot_hadamard = None
+                            self.hadanorm_sigma = None
+                            self._outlier_method = OUTLIER_METHOD_NONE
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                             #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly (per-row, including FP8 -> INT8).
                             device = _get_int8_compute_device(weight_tensor.device)
                             w_gpu = weight_tensor.to(device, non_blocking=True)
+                            outlier_method = _normalize_outlier_method(Int8TensorwiseOps.outlier_method)
                             if _is_float8_dtype(w_gpu.dtype):
                                 w_gpu = w_gpu.to(torch.float16 if device.type == "cuda" else torch.float32)
-                            elif Int8TensorwiseOps.enable_quarot and w_gpu.dtype in (torch.float16, torch.bfloat16):
-                                # Higher precision before Hadamard rotation generally improves OTF stability.
+                            elif outlier_method != OUTLIER_METHOD_NONE and w_gpu.dtype in (torch.float16, torch.bfloat16):
                                 w_gpu = w_gpu.float()
                             self._use_quarot = False
+                            self.quarot_hadamard = None
+                            self.hadanorm_sigma = None
+                            self._outlier_method = OUTLIER_METHOD_NONE
 
                             if (
-                                Int8TensorwiseOps.enable_quarot
+                                outlier_method != OUTLIER_METHOD_NONE
                                 and _QUAROT_AVAILABLE
                                 and w_gpu.ndim == 2
                                 and w_gpu.shape[1] % _QUAROT_GROUP_SIZE == 0
                             ):
                                 try:
                                     h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=device, dtype=w_gpu.dtype)
+                                    if outlier_method == OUTLIER_METHOD_HADANORM:
+                                        hadanorm_sigma = _compute_hadanorm_sigma(w_gpu).to(device=device, dtype=w_gpu.dtype)
+                                        w_gpu = w_gpu * hadanorm_sigma.view(1, -1)
+                                        self.hadanorm_sigma = hadanorm_sigma.detach().cpu()
                                     w_gpu = _quarot_rotate_weight(w_gpu, h_matrix, group_size=_QUAROT_GROUP_SIZE)
-                                    self._use_quarot = True
                                     self.quarot_hadamard = h_matrix.detach().cpu()
+                                    self._use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
+                                    self._outlier_method = outlier_method
                                 except Exception:
                                     self._use_quarot = False
                                     self.quarot_hadamard = None
-                            else:
-                                self.quarot_hadamard = None
+                                    self.hadanorm_sigma = None
+                                    self._outlier_method = OUTLIER_METHOD_NONE
 
                             q_weight, q_scale = quantize_int8_rowwise(w_gpu)
                             #print("Quantizing", prefix)
@@ -1300,18 +1509,20 @@ if _COMFY_OPS_AVAILABLE:
                             self._is_quantized = True
                             self._is_per_row = self.weight_scale.dim() == 2 and self.weight_scale.shape[1] == 1
                             quantized_now = True
-                            quarot_now = self._use_quarot
+                            outlier_adjusted_now = self._outlier_method != OUTLIER_METHOD_NONE
 
                         if track_progress:
                             Int8TensorwiseOps._update_otf_progress(
                                 quantized=quantized_now,
-                                quarot=quarot_now,
+                                outlier_adjusted=outlier_adjusted_now,
                             )
                     else:
                         self._is_quantized = False
                         self._is_per_row = False
                         self._use_quarot = False
                         self.quarot_hadamard = None
+                        self.hadanorm_sigma = None
+                        self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                 else:
                     missing_keys.append(weight_key)
@@ -1401,67 +1612,75 @@ if _COMFY_OPS_AVAILABLE:
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
                 
                 x_shape = x.shape
-                x_2d = x.reshape(-1, x_shape[-1])
-
-                if self._use_quarot and isinstance(self.quarot_hadamard, torch.Tensor):
-                    feature_count = x_2d.shape[-1]
-                    if feature_count % _QUAROT_GROUP_SIZE == 0:
-                        x_rotate = x_2d
-                        if x_rotate.device.type == "cpu" and x_rotate.dtype in (torch.float16, torch.bfloat16):
-                            x_rotate = x_rotate.float()
-
-                        h_matrix = self.quarot_hadamard
-                        if h_matrix.device != x_rotate.device or h_matrix.dtype != x_rotate.dtype:
-                            h_matrix = h_matrix.to(x_rotate.device, dtype=x_rotate.dtype, non_blocking=True)
-
-                        group_count = feature_count // _QUAROT_GROUP_SIZE
-                        x_grouped = x_rotate.reshape(-1, group_count, _QUAROT_GROUP_SIZE)
-                        x_rotated = torch.matmul(x_grouped, h_matrix)
-                        x_2d = x_rotated.reshape_as(x_rotate)
-                        if x_2d.dtype != x.dtype:
-                            x_2d = x_2d.to(x.dtype)
+                outlier_method = _get_module_outlier_method(self)
+                x_transformed, correction_source = _apply_outlier_activation_transform(
+                    x,
+                    outlier_method,
+                    hadamard=self.quarot_hadamard,
+                    hadanorm_sigma=self.hadanorm_sigma,
+                )
+                x_2d = x_transformed.reshape(-1, x_shape[-1])
 
                 use_triton = bool(Int8TensorwiseOps.use_triton)
                 
                 small_batch_threshold = _get_small_batch_fallback_threshold(self)
                 use_small_batch_fallback = small_batch_threshold > 0 and x_2d.shape[0] <= small_batch_threshold
+                correction_2d = None
+                input_2d = x_2d
+                matmul_bias = bias
+                if correction_source is not None:
+                    correction_2d = correction_source.reshape(-1, correction_source.shape[-1])
+                    input_2d = torch.cat((x_2d, correction_2d), dim=0)
+                    matmul_bias = None
+
                 if use_small_batch_fallback:
                     # Small batch fallback
-                    w_float = dequantize(weight, w_scale).to(x.dtype)
-                    bias_typed = bias.to(x.dtype) if bias is not None else None
-                    y = F.linear(x_2d, w_float, bias_typed)
+                    w_float = dequantize(weight, w_scale).to(input_2d.dtype)
+                    bias_typed = matmul_bias.to(input_2d.dtype) if matmul_bias is not None else None
+                    y = F.linear(input_2d, w_float, bias_typed)
                 else:
                     if self._is_per_row:
                         y = int8_forward_dynamic_per_row(
-                            x_2d,
+                            input_2d,
                             weight,
                             w_scale,
-                            bias,
+                            matmul_bias,
                             compute_dtype,
                             use_triton=use_triton,
                         )
                     else:
                         y = int8_forward_dynamic(
-                            x_2d,
+                            input_2d,
                             weight,
                             w_scale,
-                            bias,
+                            matmul_bias,
                             compute_dtype,
                             use_triton=use_triton,
                         )
+
+                if correction_2d is not None:
+                    y, correction = y.split((x_2d.shape[0], correction_2d.shape[0]), dim=0)
+                    if bias is not None:
+                        y = y + bias.to(y.dtype)
+                    y_view = y.reshape(*x_shape[:-1], y.shape[-1])
+                    correction = correction.reshape(*correction_source.shape[:-1], correction.shape[-1])
+                    y_view = y_view + correction.to(y_view.dtype)
+                else:
+                    y_view = y.reshape(*x_shape[:-1], y.shape[-1])
                 
                 # Dynamic LoRA Path
-                y = apply_dynamic_lora_delta(
-                    x_2d=x_2d,
-                    y=y,
+                y_view = apply_dynamic_lora_delta(
+                    x_input=x_transformed,
+                    y=y_view,
                     lora_A=self.lora_A,
                     lora_B=self.lora_B,
                     lora_alpha=self.lora_alpha,
                     lora_entries=self.dynamic_lora_entries,
                     device=x.device,
+                    correction_x=correction_source,
                 )
                 
-                return y.reshape(*x_shape[:-1], y.shape[-1])
+                return y_view.reshape(*x_shape[:-1], y_view.shape[-1])
         
         # Pass-through for other layers
         class GroupNorm(manual_cast.GroupNorm): pass

@@ -77,7 +77,7 @@ Practical guidance:
 
 Loads INT8 diffusion models using `Int8TensorwiseOps` and architecture-specific exclusion presets.
 
-When `on_the_fly_quantization` is enabled, eligible float or FP8 weights are quantized to INT8 with per-row weight scales. When `enable_quarot` is also enabled, compatible OTF layers use a Hadamard rotation before quantization.
+When `on_the_fly_quantization` is enabled, eligible float or FP8 weights are quantized to INT8 with per-row weight scales. `outlier_method` controls whether compatible OTF layers use an outlier-mitigation transform before quantization.
 
 Supported `model_type` presets:
 
@@ -98,9 +98,19 @@ Settings:
 
 - `model_type`: defaults to `auto`, which inspects the loaded `MODEL` and selects a known exclusion preset when possible. Use a specific preset to override detection. Use `none` only for experiments because it disables preset exclusions.
 - `bake_loaded_loras`: applies current stock LoRA weight patches before quantization and removes consumed patches.
-- `enable_quarot`: applies the experimental Hadamard rotation path for compatible layers.
+- `outlier_method`: choose `none`, `quarot`, or `hadanorm`. `quarot` applies the Hadamard rotation path for compatible layers. `hadanorm` adds static per-channel scaling, Hadamard mixing, dynamic centering, and a runtime correction term on compatible layers.
 - `use_triton`: toggles this extension's Triton INT8 matmul path.
 - `log_progress`: prints quantization progress and layer counts.
+
+Outlier method guidance:
+
+| Method | Behavior | Speed expectation |
+| --- | --- | --- |
+| `none` | Quantizes eligible layers directly with per-row weight scales and dynamic activation quantization. | Fastest path and the default. |
+| `quarot` | Applies Hadamard rotation to compatible layers before quantization and rotates activations at runtime. | Usually between `none` and `hadanorm`. |
+| `hadanorm` | Applies static per-channel scaling, Hadamard mixing, dynamic centering, and a correction term. Post-INT8 LoRA patching uses the same transformed space. | Slowest of the three because it adds extra runtime math. |
+
+`hadanorm` is experimental in this project. It uses a static sigma heuristic derived from weight-channel magnitudes rather than a separate calibration pass, so treat it as a quality/speed comparison mode rather than a settled default. It is compatible with `TorchCompileModelAdvanced`, but compiled speed is still expected to lag behind `none` because the transform and correction work are fairly heavy operations.
 
 If `auto` cannot identify the architecture, the adapter uses a conservative union of known exclusion patterns and logs a warning. Manual `model_type` selection is faster when you know the architecture.
 

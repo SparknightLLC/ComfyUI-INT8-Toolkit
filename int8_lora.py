@@ -88,21 +88,24 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache):
 
 			if is_quantized and _is_weight_adapter(adapter):
 				weight_scale = _get_weight_scale_for_module(target_module)
-				use_quarot = bool(getattr(target_module, "_use_quarot", False))
+				outlier_method = getattr(target_module, "_outlier_method", None)
+				hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
 				if _is_plain_lora_adapter(adapter):
 					new_adapter = INT8LoRAPatchAdapter(
 						adapter.loaded_keys,
 						adapter.weights,
 						weight_scale,
 						seed=seed,
-						use_quarot=use_quarot,
+						outlier_method=outlier_method,
+						hadanorm_sigma=hadanorm_sigma,
 					)
 				else:
 					new_adapter = INT8WeightPatchAdapter(
 						adapter,
 						weight_scale,
 						seed=seed,
-						use_quarot=use_quarot,
+						outlier_method=outlier_method,
+						hadanorm_sigma=hadanorm_sigma,
 					)
 
 				final_patch_dict[key] = new_adapter
@@ -255,14 +258,16 @@ class INT8LoraLoaderStack:
 					continue
 
 				weight_scale = _get_weight_scale_for_module(target_module)
-				use_quarot = bool(getattr(target_module, "_use_quarot", False))
+				outlier_method = getattr(target_module, "_outlier_method", None)
+				hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
 				mergeable = all(hasattr(adapter, "calculate_weight") for adapter, _ in patches)
 				if mergeable:
 					final_patch_dict[key] = INT8MergedLoRAPatchAdapter(
 						patches,
 						weight_scale,
 						seed=seed,
-						use_quarot=use_quarot,
+						outlier_method=outlier_method,
+						hadanorm_sigma=hadanorm_sigma,
 					)
 					applied_count += 1
 				else:

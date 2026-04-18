@@ -1,10 +1,15 @@
 import torch
 import folder_paths
 
-from .int8_quant import Int8TensorwiseOps
+from .int8_quant import (
+    Int8TensorwiseOps,
+    OUTLIER_METHOD_CHOICES,
+    OUTLIER_METHOD_NONE,
+)
 
 
 MODEL_TYPE_CHOICES = ["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"]
+DEFAULT_OUTLIER_METHOD = OUTLIER_METHOD_NONE
 
 
 def get_model_type_exclusions(model_type):
@@ -67,7 +72,7 @@ class UNetLoaderINTW8A8:
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"], {"tooltip": "Requested source weight dtype passed to ComfyUI during model construction. INT8 checkpoints still load as INT8 when weight_scale tensors are present."}),
                 "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights to INT8 during loading. Leave off for already-quantized INT8 checkpoints."}),
-                "enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "When on-the-fly quantization is enabled, rotate compatible layers before INT8 quantization. Experimental; compare quality before using by default."}),
+                "outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply during on-the-fly INT8 quantization. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
             }
         }
 
@@ -76,7 +81,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, outlier_method=DEFAULT_OUTLIER_METHOD):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         # Use Int8TensorwiseOps for proper direct int8 loading
@@ -95,7 +100,7 @@ class UNetLoaderINTW8A8:
         # Set quantization flags for this load
         Int8TensorwiseOps.excluded_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
-        Int8TensorwiseOps.enable_quarot = bool(on_the_fly_quantization and enable_quarot)
+        Int8TensorwiseOps.outlier_method = outlier_method if on_the_fly_quantization else DEFAULT_OUTLIER_METHOD
         Int8TensorwiseOps.use_triton = True
         Int8TensorwiseOps._is_prequantized = False
         Int8TensorwiseOps.reset_otf_progress()

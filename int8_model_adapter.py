@@ -4,13 +4,18 @@ import uuid
 import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
+import comfy.utils
 import torch
 from torch import nn
 
 from .int8_quant import (
 	Int8TensorwiseOps,
+	OUTLIER_METHOD_HADANORM,
+	OUTLIER_METHOD_NONE,
+	OUTLIER_METHOD_QUAROT,
 	_QUAROT_AVAILABLE,
 	_QUAROT_GROUP_SIZE,
+	_compute_hadanorm_sigma,
 	_get_int8_compute_device,
 	_is_float8_dtype,
 	_quarot_build_hadamard,
@@ -18,6 +23,8 @@ from .int8_quant import (
 	quantize_int8_rowwise,
 )
 from .int8_unet_loader import MODEL_TYPE_CHOICES as LOADER_MODEL_TYPE_CHOICES
+from .int8_unet_loader import OUTLIER_METHOD_CHOICES
+from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
 from .int8_unet_loader import get_model_type_exclusions
 
 
@@ -230,30 +237,39 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 	return patched_weight.detach(), layer_patch_keys
 
 
-def _quantize_linear_module(module_name, module, source_weight, enable_quarot):
+def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	compute_device = _get_int8_compute_device(source_weight.device)
 	weight_work = source_weight.to(compute_device, non_blocking=True)
+	outlier_method = (outlier_method or OUTLIER_METHOD_NONE).strip().lower()
+	use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
 
 	if _is_float8_dtype(weight_work.dtype):
 		weight_work = weight_work.to(torch.float16 if compute_device.type == "cuda" else torch.float32)
-	elif enable_quarot and weight_work.dtype in (torch.float16, torch.bfloat16):
+	elif outlier_method != OUTLIER_METHOD_NONE and weight_work.dtype in (torch.float16, torch.bfloat16):
 		weight_work = weight_work.float()
 
-	use_quarot = False
 	quarot_hadamard = None
+	hadanorm_sigma = None
 	if (
-		enable_quarot
+		outlier_method != OUTLIER_METHOD_NONE
 		and _QUAROT_AVAILABLE
 		and weight_work.ndim == 2
 		and weight_work.shape[1] % _QUAROT_GROUP_SIZE == 0
 	):
 		try:
 			h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=compute_device, dtype=weight_work.dtype)
+			if outlier_method == OUTLIER_METHOD_HADANORM:
+				hadanorm_sigma = _compute_hadanorm_sigma(weight_work).to(device=compute_device, dtype=weight_work.dtype)
+				weight_work = weight_work * hadanorm_sigma.view(1, -1)
 			weight_work = _quarot_rotate_weight(weight_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
-			use_quarot = True
 			quarot_hadamard = h_matrix.detach().cpu()
 		except Exception as e:
-			logging.warning(f"INT8 Model Adapter: QuaRot skipped for {module_name} ({e}).")
+			logging.warning(f"INT8 Model Adapter: {outlier_method} skipped for {module_name} ({e}).")
+			use_quarot = False
+			outlier_method = OUTLIER_METHOD_NONE
+
+	if quarot_hadamard is None and not isinstance(hadanorm_sigma, torch.Tensor) and not use_quarot:
+		outlier_method = OUTLIER_METHOD_NONE
 
 	q_weight, q_scale = quantize_int8_rowwise(weight_work)
 	q_module = Int8TensorwiseOps.Linear(
@@ -272,6 +288,8 @@ def _quantize_linear_module(module_name, module, source_weight, enable_quarot):
 	q_module._is_per_row = q_module.weight_scale.dim() == 2 and q_module.weight_scale.shape[1] == 1
 	q_module._use_quarot = use_quarot
 	q_module.quarot_hadamard = quarot_hadamard
+	q_module.hadanorm_sigma = hadanorm_sigma.detach().cpu() if isinstance(hadanorm_sigma, torch.Tensor) else None
+	q_module._outlier_method = outlier_method
 	q_module.compute_dtype = getattr(module, "compute_dtype", torch.bfloat16)
 	q_module.dynamic_lora_entries = None
 	q_module.lora_A = None
@@ -284,7 +302,7 @@ def _quantize_linear_module(module_name, module, source_weight, enable_quarot):
 		q_module.bias = None
 
 	q_module.train(module.training)
-	return q_module, use_quarot
+	return q_module, outlier_method != OUTLIER_METHOD_NONE
 
 
 def _cleanup_torch_memory():
@@ -374,6 +392,30 @@ def _clear_prior_int8_object_patches(model_patcher):
 			model_patcher.object_patches.pop(patch_key, None)
 
 
+def _restore_applied_int8_object_patches(model_patcher):
+	restored_count = 0
+	for patch_key, backup_obj in list(model_patcher.object_patches_backup.items()):
+		if not patch_key.startswith("diffusion_model."):
+			continue
+
+		try:
+			current_obj = comfy.utils.get_attr(model_patcher.model, patch_key)
+		except Exception:
+			continue
+
+		if not isinstance(current_obj, Int8TensorwiseOps.Linear):
+			continue
+
+		try:
+			comfy.utils.set_attr(model_patcher.model, patch_key, backup_obj)
+			model_patcher.object_patches_backup.pop(patch_key, None)
+			restored_count += 1
+		except Exception as e:
+			logging.warning(f"INT8 Model Adapter: failed to restore prior INT8 object patch {patch_key} ({e}).")
+
+	return restored_count
+
+
 class INT8ModelAdapter:
 	@classmethod
 	def INPUT_TYPES(s):
@@ -383,7 +425,7 @@ class INT8ModelAdapter:
 				"enable_int8": ("BOOLEAN", {"default": True, "tooltip": "Disable this to pass the input model through unchanged without removing the node from a workflow."}),
 				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. Use none only for experiments."}),
 				"bake_loaded_loras": ("BOOLEAN", {"default": True, "tooltip": "Apply existing stock LoRA weight patches, including sliced patches, before quantization, then remove the consumed patches to avoid applying them twice. If disabled, layers with pending patches are left unquantized."}),
-				"enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "Apply Hadamard rotation before quantizing compatible layers. This can improve some outlier cases but may reduce quality on some models."}),
+				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
 				"use_triton": ("BOOLEAN", {"default": True, "tooltip": "Use this extension's Triton INT8 matmul kernels when available; disable for troubleshooting or fallback benchmarking."}),
 				"log_progress": ("BOOLEAN", {"default": True, "tooltip": "Print quantization progress and layer counts to the ComfyUI console."}),
 			}
@@ -400,7 +442,7 @@ class INT8ModelAdapter:
 		enable_int8,
 		model_type,
 		bake_loaded_loras,
-		enable_quarot,
+		outlier_method,
 		use_triton,
 		log_progress,
 	):
@@ -408,6 +450,7 @@ class INT8ModelAdapter:
 			return (model,)
 
 		model_patcher = model.clone()
+		restored_prior_patch_count = _restore_applied_int8_object_patches(model_patcher)
 		_clear_prior_int8_object_patches(model_patcher)
 		diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
 		if diffusion_model is None:
@@ -440,6 +483,8 @@ class INT8ModelAdapter:
 		last_bucket = -1
 
 		if log_progress:
+			if restored_prior_patch_count:
+				print(f"[INT8 Model Adapter] Restored {restored_prior_patch_count} prior INT8 object patches before requantizing.")
 			print(f"[INT8 Model Adapter] Starting MODEL quantization (eligible linear layers: {total})")
 
 		for index, (module_name, module) in enumerate(candidates, start=1):
@@ -459,7 +504,7 @@ class INT8ModelAdapter:
 					module_name,
 					module,
 					source_weight,
-					bool(enable_quarot),
+					outlier_method,
 				)
 				model_patcher.add_object_patch(_module_patch_key(module_name), q_module)
 				quantized += 1
@@ -486,7 +531,7 @@ class INT8ModelAdapter:
 						f"({index}/{total}) quantized={quantized} "
 						f"baked_patches={baked_lora_count} "
 						f"skipped_patched={skipped_patched_count} "
-						f"quarot={quarot_count}"
+						f"outlier_adjusted={quarot_count}"
 					)
 
 		if "transformer_options" not in model_patcher.model_options:
@@ -498,12 +543,12 @@ class INT8ModelAdapter:
 			"model_type": resolved_model_type,
 			"requested_model_type": model_type,
 			"bake_loaded_loras": bool(bake_loaded_loras),
-			"enable_quarot": bool(enable_quarot),
+			"outlier_method": outlier_method,
 			"use_triton": bool(use_triton),
 			"log_progress": bool(log_progress),
 			"quantized_layers": quantized,
 			"baked_lora_layers": baked_lora_count,
-			"quarot_layers": quarot_count,
+			"outlier_adjusted_layers": quarot_count,
 			"skipped_patched_layers": skipped_patched_count,
 		}
 		setattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", True)
@@ -515,7 +560,7 @@ class INT8ModelAdapter:
 			print(
 				"[INT8 Model Adapter] Complete "
 				f"(quantized={quantized}, baked_patches={baked_lora_count}, "
-				f"skipped_patched_layers={skipped_patched_count}, quarot={quarot_count})"
+				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count})"
 			)
 
 		return (model_patcher,)

@@ -89,7 +89,8 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
             w_scale = target_module.weight_scale
             if isinstance(w_scale, torch.Tensor):
                 w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
-            use_quarot = bool(getattr(target_module, "_use_quarot", False))
+            outlier_method = getattr(target_module, "_outlier_method", None)
+            hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
 
             if _LORA_ADAPTER_AVAILABLE and isinstance(adapter, LoRAAdapter):
                 wrapped_patch_dict[key] = INT8LoRAPatchAdapter(
@@ -97,14 +98,16 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
                     adapter.weights,
                     w_scale,
                     seed=seed,
-                    use_quarot=use_quarot,
+                    outlier_method=outlier_method,
+                    hadanorm_sigma=hadanorm_sigma,
                 )
             else:
                 wrapped_patch_dict[key] = INT8WeightPatchAdapter(
                     adapter,
                     w_scale,
                     seed=seed,
-                    use_quarot=use_quarot,
+                    outlier_method=outlier_method,
+                    hadanorm_sigma=hadanorm_sigma,
                 )
         except Exception:
             wrapped_patch_dict[key] = adapter
