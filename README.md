@@ -2,6 +2,8 @@
 
 This project began as a fork of [ComfyUI-INT8-Fast](https://github.com/BobJohnson24/ComfyUI-INT8-Fast), but it is now maintained as its own INT8 solution for ComfyUI rather than a mere compatibility branch.
 
+![workflow](example_workflows/load_workflow.png)
+
 This codebase has its own workflow model, node surface, adapter behavior, and performance tuning path, while continuing to selectively incorporate useful upstream fixes.
 
 The main differentiator is `Enable INT8 on MODEL`: a `MODEL -> MODEL` node that can convert a model loaded by ComfyUI's stock diffusion loader into this extension's INT8 runtime. That lets standard diffusion loaders and stock LoRA loaders remain part of the workflow, then INT8 can be enabled after those patches are in place.

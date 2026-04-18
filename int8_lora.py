@@ -211,23 +211,27 @@ class INT8LoraLoaderStack:
 		if mode == "Dynamic":
 			return _dispatch_dynamic_stack(model, kwargs)
 
-		all_loras = []
+		lora_entries = []
 		for i in range(1, 11):
 			name = kwargs.get(f"lora_{i}")
 			strength = kwargs.get(f"strength_{i}", 0)
 			if name and name != "None" and strength != 0:
-				path = folder_paths.get_full_path("loras", name)
-				data = comfy.utils.load_torch_file(path, safe_load=True)
-				all_loras.append((data, strength, name))
+				lora_entries.append((name, strength))
 
-		if not all_loras:
+		if not lora_entries:
 			return (model,)
+
+		if len(lora_entries) == 1:
+			lora_name, strength = lora_entries[0]
+			return INT8LoraLoader().load_lora("Stochastic", model, lora_name, strength, seed=seed)
 
 		model_patcher = model.clone()
 		key_map = _get_key_map(model_patcher)
 
 		layered_patches = {}
-		for data, strength, _name in all_loras:
+		for name, strength in lora_entries:
+			path = folder_paths.get_full_path("loras", name)
+			data = comfy.utils.load_torch_file(path, safe_load=True)
 			patch_dict = comfy.lora.load_lora(data, key_map, log_missing=True)
 			del data
 			for key, adapter in patch_dict.items():
@@ -270,8 +274,8 @@ class INT8LoraLoaderStack:
 
 		model_patcher.add_patches(final_patch_dict, 1.0)
 
-		logging.info(f"INT8 LoRA Stack ({mode}): Merged {len(all_loras)} LoRAs for {applied_count} quantized layers.")
-		print(f"[INT8 LoRA Stack:{mode}] Applied {len(all_loras)} LoRAs, merged {applied_count} quantized layers.")
+		logging.info(f"INT8 LoRA Stack ({mode}): Merged {len(lora_entries)} LoRAs for {applied_count} quantized layers.")
+		print(f"[INT8 LoRA Stack:{mode}] Applied {len(lora_entries)} LoRAs, merged {applied_count} quantized layers.")
 		return (model_patcher,)
 
 

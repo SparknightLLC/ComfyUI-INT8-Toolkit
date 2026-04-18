@@ -3,6 +3,7 @@ import uuid
 
 import comfy.lora
 import comfy.model_management
+import comfy.patcher_extension
 import torch
 from torch import nn
 
@@ -23,6 +24,7 @@ from .int8_unet_loader import get_model_type_exclusions
 AUTO_MODEL_TYPE = "auto"
 NONE_MODEL_TYPE = "none"
 MODEL_TYPE_CHOICES = [AUTO_MODEL_TYPE] + LOADER_MODEL_TYPE_CHOICES + [NONE_MODEL_TYPE]
+_INT8_MODEL_ADAPTER_WRAPPER_KEY = "int8_model_adapter_cache_notice"
 
 MODEL_TYPE_FINGERPRINTS = {
 	"flux2": (
@@ -91,7 +93,6 @@ MODEL_TYPE_REQUIRED_MARKERS = {
 	"anima": ("llm",),
 	"qwen": ("time_text_embed", "norm_out", "proj_out"),
 }
-
 
 def _module_weight_key(module_name):
 	return f"diffusion_model.{module_name}.weight"
@@ -295,6 +296,78 @@ def _cleanup_torch_memory():
 		pass
 
 
+def _extract_transformer_options(args, kwargs):
+	transformer_options = kwargs.get("transformer_options", None)
+	if transformer_options is None and len(args) > 5:
+		transformer_options = args[5]
+	if transformer_options is None:
+		transformer_options = {}
+	return transformer_options
+
+
+def _is_first_sampling_step(transformer_options):
+	sample_sigmas = transformer_options.get("sample_sigmas", None)
+	current_sigmas = transformer_options.get("sigmas", None)
+	if not isinstance(sample_sigmas, torch.Tensor) or sample_sigmas.numel() == 0:
+		return False
+	if not isinstance(current_sigmas, torch.Tensor) or current_sigmas.numel() == 0:
+		return False
+
+	try:
+		start_sigma = float(sample_sigmas.reshape(-1)[0].item())
+		current_sigma = float(current_sigmas.reshape(-1)[0].item())
+	except Exception:
+		return False
+
+	return abs(current_sigma - start_sigma) <= max(1e-6, abs(start_sigma) * 1e-6)
+
+
+def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
+	transformer_options = _extract_transformer_options(args, kwargs)
+	adapter_state = transformer_options.get("int8_model_adapter", None)
+	base_model = executor.class_obj
+	diffusion_model = getattr(base_model, "diffusion_model", None)
+
+	if isinstance(adapter_state, dict) and adapter_state.get("log_progress") and diffusion_model is not None:
+		if getattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", False):
+			diffusion_model._int8_model_adapter_skip_cache_notice_once = False
+			diffusion_model._int8_model_adapter_notice_in_generation = True
+		elif _is_first_sampling_step(transformer_options):
+			if not getattr(diffusion_model, "_int8_model_adapter_notice_in_generation", False):
+				print(
+					"[INT8 Model Adapter] Reusing cached INT8 MODEL output "
+					f"(quantized_layers={adapter_state.get('quantized_layers', '?')}, "
+					f"model_type={adapter_state.get('model_type', '?')})."
+				)
+				diffusion_model._int8_model_adapter_notice_in_generation = True
+		else:
+			diffusion_model._int8_model_adapter_notice_in_generation = False
+
+	return executor(*args, **kwargs)
+
+
+def _ensure_int8_model_adapter_notice_wrapper(model_patcher):
+	model_patcher.remove_wrappers_with_key(
+		comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+		_INT8_MODEL_ADAPTER_WRAPPER_KEY,
+	)
+	model_patcher.add_wrapper_with_key(
+		comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+		_INT8_MODEL_ADAPTER_WRAPPER_KEY,
+		_int8_model_adapter_notice_wrapper,
+	)
+
+
+def _collect_int8_candidates(diffusion_model, excluded_names):
+	return [
+		(module_name, module)
+		for module_name, module in diffusion_model.named_modules()
+		if module_name
+		and not _is_excluded(module_name, excluded_names)
+		and _is_supported_linear(module)
+	]
+
+
 def _clear_prior_int8_object_patches(model_patcher):
 	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
 		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
@@ -348,13 +421,16 @@ class INT8ModelAdapter:
 		)
 		Int8TensorwiseOps.use_triton = bool(use_triton)
 
-		candidates = [
-			(module_name, module)
-			for module_name, module in diffusion_model.named_modules()
-			if module_name
-			and not _is_excluded(module_name, excluded_names)
-			and _is_supported_linear(module)
-		]
+		candidates = _collect_int8_candidates(diffusion_model, excluded_names)
+		if not candidates:
+			try:
+				if log_progress:
+					print("[INT8 Model Adapter] No eligible layers found on first scan; forcing model load and rescanning.")
+				comfy.model_management.load_models_gpu([model_patcher], force_patch_weights=True, force_full_load=True)
+				diffusion_model = getattr(model_patcher.model, "diffusion_model", diffusion_model)
+				candidates = _collect_int8_candidates(diffusion_model, excluded_names)
+			except Exception as e:
+				logging.warning(f"INT8 Model Adapter: forced model load failed during candidate scan ({e}).")
 
 		total = len(candidates)
 		quantized = 0
@@ -424,11 +500,14 @@ class INT8ModelAdapter:
 			"bake_loaded_loras": bool(bake_loaded_loras),
 			"enable_quarot": bool(enable_quarot),
 			"use_triton": bool(use_triton),
+			"log_progress": bool(log_progress),
 			"quantized_layers": quantized,
 			"baked_lora_layers": baked_lora_count,
 			"quarot_layers": quarot_count,
 			"skipped_patched_layers": skipped_patched_count,
 		}
+		setattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", True)
+		_ensure_int8_model_adapter_notice_wrapper(model_patcher)
 		model_patcher.patches_uuid = uuid.uuid4()
 		_cleanup_torch_memory()
 

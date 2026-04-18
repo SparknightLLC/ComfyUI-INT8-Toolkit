@@ -1,8 +1,8 @@
 # pyproject.toml
 [project]
-name = "comfyui-int8-fast-fork"
+name = "comfyui-int8-fast-fork" # immutable
 description = "Standalone INT8 toolkit for ComfyUI with stock MODEL adapter support, unified INT8 LoRA nodes, and additional low-VRAM fixes."
-version = "0.1.0"
+version = "0.1.1"
 license = { file = "LICENSE" }
 dependencies = []
 
