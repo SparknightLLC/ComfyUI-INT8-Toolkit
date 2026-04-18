@@ -3,6 +3,9 @@ import os
 import logging
 from torch import Tensor, nn
 import torch.nn.functional as F
+import comfy.model_management
+
+_INT8_FORCE_DISABLE_TORCH_COMPILE = os.environ.get("INT8_FORCE_DISABLE_TORCH_COMPILE", "0") == "1"
 
 # Add this at the top of your file
 try:
@@ -15,8 +18,23 @@ except ImportError:
     print("Triton not found, falling back to torch._int_mm")
 
 try:
-    _disable_torch_compile = torch.compiler.disable
+    from .quarot import build_hadamard as _quarot_build_hadamard
+    from .quarot import rotate_weight as _quarot_rotate_weight
+    _QUAROT_AVAILABLE = True
 except Exception:
+    _QUAROT_AVAILABLE = False
+
+if _INT8_FORCE_DISABLE_TORCH_COMPILE:
+    try:
+        _disable_torch_compile = torch.compiler.disable
+    except Exception:
+        try:
+            import torch._dynamo as _torch_dynamo
+            _disable_torch_compile = _torch_dynamo.disable
+        except Exception:
+            def _disable_torch_compile(fn):
+                return fn
+else:
     def _disable_torch_compile(fn):
         return fn
 
@@ -33,6 +51,8 @@ except ValueError:
 _ADAPTIVE_SMALL_BATCH_FALLBACK = os.environ.get("INT8_SMALL_BATCH_FALLBACK_ADAPTIVE", "1") == "1"
 _DYNAMIC_LORA_DEBUG = os.environ.get("INT8_DYNAMIC_LORA_DEBUG", "0") == "1"
 _DYNAMIC_LORA_BATCH = os.environ.get("INT8_DYNAMIC_LORA_BATCH", "1") == "1"
+_QUAROT_GROUP_SIZE = 128
+_QUAROT_OFFSET_WARNED: set[tuple[int, int, int] | str] = set()
 
 try:
     _DYNAMIC_LORA_BATCH_MAX_RANK = max(64, int(os.environ.get("INT8_DYNAMIC_LORA_BATCH_MAX_RANK", "4096")))
@@ -50,6 +70,14 @@ _FLOAT8_DTYPES = tuple(
 )
 
 # --- Quantization Utils ---
+
+def _get_int8_compute_device(fallback_device: torch.device | None = None) -> torch.device:
+    try:
+        return comfy.model_management.get_torch_device()
+    except Exception:
+        if fallback_device is not None:
+            return fallback_device
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return dtype in _FLOAT8_DTYPES
@@ -108,10 +136,14 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
     # Stochastic rounding
     x_floor = torch.floor(x_scaled)
     fraction = x_scaled - x_floor
+    del x_scaled
     
     # Speed optimization: Create random values directly on the target device
-    random_vals = torch.rand(x_scaled.shape, generator=generator, device=x.device, dtype=x_scaled.dtype)
+    random_vals = torch.rand(x_floor.shape, generator=generator, device=x.device, dtype=x_floor.dtype)
     x_rounded = torch.where(random_vals < fraction, x_floor + 1, x_floor)
+    del random_vals
+    del fraction
+    del x_floor
     
     return torch.clamp(x_rounded, -128, 127).to(torch.int8)
 
@@ -120,11 +152,18 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
 
 @torch.no_grad()
 @_disable_torch_compile
-def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+def int8_forward_dynamic(
+    x: Tensor,
+    weight: Tensor,
+    weight_scale: float | Tensor,
+    bias: Tensor | None,
+    compute_dtype: torch.dtype,
+    use_triton: bool = True,
+) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
     
     # --- FAST PATH: Triton Fused Kernel ---
-    if _TRITON_AVAILABLE and x.is_cuda:
+    if _TRITON_AVAILABLE and use_triton and x.is_cuda:
         return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -146,11 +185,18 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
 
 @torch.no_grad()
 @_disable_torch_compile
-def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+def int8_forward_dynamic_per_row(
+    x: Tensor,
+    weight: Tensor,
+    weight_scale: Tensor,
+    bias: Tensor | None,
+    compute_dtype: torch.dtype,
+    use_triton: bool = True,
+) -> Tensor:
     """Forward with dynamic per-token activation quantization and per-row weight quantization."""
 
     # --- FAST PATH: Triton Fused Kernel (per-row) ---
-    if _TRITON_AVAILABLE and x.is_cuda:
+    if _TRITON_AVAILABLE and use_triton and x.is_cuda:
         return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -516,17 +562,71 @@ def _get_effective_weight_scale(weight_scale, row_count, offset=None):
     # Fall back to scalar mean to avoid shape/device crashes.
     return weight_scale.float().mean()
 
+def _quarot_offset_supported(offset, input_width: int, group_size: int) -> bool:
+    normalized = _normalize_dynamic_offset(offset)
+    if normalized is None:
+        return True
+
+    dim, start, size = normalized
+    if dim == 0:
+        return True
+    if dim != 1:
+        return False
+
+    if size != input_width:
+        return False
+    if start < 0 or size <= 0:
+        return False
+    if (start % group_size) != 0 or (size % group_size) != 0:
+        return False
+    return True
+
+def _rotate_delta_for_quarot_if_needed(
+    delta_f: Tensor,
+    use_quarot: bool,
+    comp_device: torch.device,
+    offset=None,
+) -> Tensor:
+    if not use_quarot:
+        return delta_f
+    if delta_f.ndim < 2 or delta_f.shape[1] % _QUAROT_GROUP_SIZE != 0:
+        return delta_f
+    if not _quarot_offset_supported(offset, delta_f.shape[1], _QUAROT_GROUP_SIZE):
+        normalized = _normalize_dynamic_offset(offset)
+        key = normalized if normalized is not None else "unsupported_offset"
+        if key not in _QUAROT_OFFSET_WARNED:
+            _QUAROT_OFFSET_WARNED.add(key)
+            logging.warning(
+                f"[INT8 QuaRot] skipping rotation for unsupported offset={normalized} "
+                f"delta_shape={tuple(delta_f.shape)}"
+            )
+        return delta_f
+
+    try:
+        if not _QUAROT_AVAILABLE:
+            return delta_f
+        rotate_dtype = torch.float32 if delta_f.dtype in (torch.float16, torch.bfloat16) else delta_f.dtype
+        delta_work = delta_f.to(comp_device, dtype=rotate_dtype)
+        h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=comp_device, dtype=rotate_dtype)
+        rotated = _quarot_rotate_weight(delta_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+        return rotated.to(delta_f.dtype)
+    except Exception:
+        return delta_f
 
 def _apply_int8_delta_inplace(weight, delta_f, weight_scale, seed, offset=None):
-    comp_device = torch.device("cuda") if torch.cuda.is_available() else weight.device
+    comp_device = _get_int8_compute_device(weight.device)
     delta_dev = delta_f.to(comp_device)
     effective_scale = _get_effective_weight_scale(weight_scale, delta_dev.shape[0], offset)
     delta_int8 = stochastic_round_int8_delta(delta_dev, effective_scale, seed)
+    del delta_dev
     res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
+    del delta_int8
     patched_weight = torch.clamp(res, -128, 127).to(torch.int8)
+    del res
     if patched_weight.device != weight.device:
         patched_weight = patched_weight.to(weight.device)
     weight.copy_(patched_weight)
+    del patched_weight
     return weight
 
 try:
@@ -546,10 +646,11 @@ if _LORA_ADAPTER_AVAILABLE:
         """
         Specialized LoRA adapter that patches INT8 weights IN-PLACE in INT8 space.
         """
-        def __init__(self, loaded_keys, weights, weight_scale, seed=0):
+        def __init__(self, loaded_keys, weights, weight_scale, seed=0, use_quarot=False):
             super().__init__(loaded_keys, weights)
             self.weight_scale = weight_scale
             self.seed = seed
+            self.use_quarot = bool(use_quarot)
 
         def _calculate_weight_fallback(self, weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype != torch.int8:
@@ -565,7 +666,7 @@ if _LORA_ADAPTER_AVAILABLE:
                 )
 
             device = weight.device
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            comp_device = _get_int8_compute_device(device)
             effective_scale = _get_effective_weight_scale(self.weight_scale, weight.shape[0], offset)
             base_weight_f = dequantize(weight.to(comp_device), effective_scale).to(intermediate_dtype)
             original_base_f = base_weight_f.clone()
@@ -582,11 +683,17 @@ if _LORA_ADAPTER_AVAILABLE:
             )
 
             delta_f = patched_weight_f - original_base_f
-            return _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+            del patched_weight_f
+            del original_base_f
+            del base_weight_f
+            delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+            final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+            del delta_f
+            return final_weight
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             device = weight.device
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            comp_device = _get_int8_compute_device(device)
             lora_diff = _compute_fast_lora_diff(self.weights, weight.shape, comp_device, intermediate_dtype)
 
             if lora_diff is None:
@@ -604,16 +711,22 @@ if _LORA_ADAPTER_AVAILABLE:
             scale = _compute_lora_scale(self.weights, strength)
             if weight.dtype == torch.int8:
                 delta_f = lora_diff * scale
-                return _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+                del lora_diff
+                delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+                final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+                del delta_f
+                return final_weight
             else:
-                return weight + (lora_diff * scale).to(weight.device, weight.dtype)
+                final_weight = weight + (lora_diff * scale).to(weight.device, weight.dtype)
+                del lora_diff
+                return final_weight
 
     class INT8MergedLoRAPatchAdapter(LoRAAdapter):
         """
         Adapter that merges multiple LoRAs in float space BEFORE applying a single
         stochastic rounding step. This is much more precise for LoRA stacks.
         """
-        def __init__(self, patches, weight_scale, seed=0):
+        def __init__(self, patches, weight_scale, seed=0, use_quarot=False):
             # We need to satisfy the base LoRAAdapter constructor.
             # We use the first patch's keys/weights as a reference.
             first_patch_adapter = patches[0][0]
@@ -623,11 +736,12 @@ if _LORA_ADAPTER_AVAILABLE:
             self.patches = patches
             self.weight_scale = weight_scale
             self.seed = seed
+            self.use_quarot = bool(use_quarot)
 
         def _calculate_weight_fallback(self, weight, key, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype == torch.int8:
                 device = weight.device
-                comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+                comp_device = _get_int8_compute_device(device)
                 effective_scale = _get_effective_weight_scale(self.weight_scale, weight.shape[0], offset)
                 base_weight_f = dequantize(weight.to(comp_device), effective_scale).to(intermediate_dtype)
                 original_base_f = base_weight_f.clone()
@@ -650,14 +764,21 @@ if _LORA_ADAPTER_AVAILABLE:
 
             if weight.dtype == torch.int8:
                 delta_f = patched_weight_f - original_base_f
-                return _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+                del patched_weight_f
+                del original_base_f
+                delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+                final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+                del delta_f
+                return final_weight
 
-            return patched_weight_f.to(weight.device, weight.dtype)
+            final_weight = patched_weight_f.to(weight.device, weight.dtype)
+            del patched_weight_f
+            return final_weight
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             # Note: 'strength' from ComfyUI is ignored here as we use internal lora_strengths
             device = weight.device
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            comp_device = _get_int8_compute_device(device)
             
             total_delta_f = None
             
@@ -691,24 +812,31 @@ if _LORA_ADAPTER_AVAILABLE:
                     total_delta_f = delta * scale
                 else:
                     total_delta_f += delta * scale
+                del delta
             
             if total_delta_f is None:
                 return weight
 
             if weight.dtype == torch.int8:
                 # One single stochastic rounding step for all combined LoRAs
-                return _apply_int8_delta_inplace(weight, total_delta_f, self.weight_scale, self.seed, offset)
+                total_delta_f = _rotate_delta_for_quarot_if_needed(total_delta_f, self.use_quarot, comp_device, offset=offset)
+                final_weight = _apply_int8_delta_inplace(weight, total_delta_f, self.weight_scale, self.seed, offset)
+                del total_delta_f
+                return final_weight
             else:
-                return weight + total_delta_f.to(device, weight.dtype)
+                final_weight = weight + total_delta_f.to(device, weight.dtype)
+                del total_delta_f
+                return final_weight
 
 if _WEIGHT_ADAPTER_BASE_AVAILABLE:
     class INT8WeightPatchAdapter(WeightAdapterBase):
         name = "int8_weight_patch"
 
-        def __init__(self, base_adapter, weight_scale, seed=0):
+        def __init__(self, base_adapter, weight_scale, seed=0, use_quarot=False):
             self.base_adapter = base_adapter
             self.weight_scale = weight_scale
             self.seed = seed
+            self.use_quarot = bool(use_quarot)
             self.loaded_keys = getattr(base_adapter, "loaded_keys", set())
             self.weights = getattr(base_adapter, "weights", ())
 
@@ -725,7 +853,7 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
                     original_weight,
                 )
 
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else weight.device
+            comp_device = _get_int8_compute_device(weight.device)
             effective_scale = _get_effective_weight_scale(self.weight_scale, weight.shape[0], offset)
             base_weight_f = dequantize(weight.to(comp_device), effective_scale).to(intermediate_dtype)
             original_base_f = base_weight_f.clone()
@@ -744,7 +872,13 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
                 return weight
 
             delta_f = patched_weight_f - original_base_f
-            return _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+            del patched_weight_f
+            del original_base_f
+            del base_weight_f
+            delta_f = _rotate_delta_for_quarot_if_needed(delta_f, self.use_quarot, comp_device, offset=offset)
+            final_weight = _apply_int8_delta_inplace(weight, delta_f, self.weight_scale, self.seed, offset)
+            del delta_f
+            return final_weight
 else:
     INT8WeightPatchAdapter = None
 
@@ -894,6 +1028,7 @@ class DynamicLoRAHook:
             # Compose
             matched_modules += 1
             entries = []
+            module_use_quarot = bool(getattr(module, "_use_quarot", False))
             for adapter, strength, offset in patches:
                 if not _LORA_ADAPTER_AVAILABLE or not isinstance(adapter, LoRAAdapter):
                     if _DYNAMIC_LORA_DEBUG:
@@ -910,6 +1045,8 @@ class DynamicLoRAHook:
                     continue
 
                 curr_A, curr_B = factors
+                if module_use_quarot and curr_A.ndim == 2 and curr_A.shape[1] % _QUAROT_GROUP_SIZE == 0:
+                    curr_A = _rotate_delta_for_quarot_if_needed(curr_A, True, curr_A.device, offset=offset)
 
                 entries.append({
                     "A": curr_A,
@@ -969,14 +1106,79 @@ if _COMFY_OPS_AVAILABLE:
         """
         excluded_names = []
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
+        enable_quarot = False
+        use_triton = True
         _is_prequantized = None # Global flag for current load
+        _otf_progress_total = None
+        _otf_progress_processed = 0
+        _otf_progress_quantized = 0
+        _otf_progress_quarot = 0
+        _otf_progress_last_bucket = -1
+
+        @classmethod
+        def reset_otf_progress(cls):
+            cls._otf_progress_total = None
+            cls._otf_progress_processed = 0
+            cls._otf_progress_quantized = 0
+            cls._otf_progress_quarot = 0
+            cls._otf_progress_last_bucket = -1
+
+        @classmethod
+        def _init_otf_progress(cls, state_dict):
+            if cls._otf_progress_total is not None:
+                return
+
+            total_estimate = 1
+            for key, value in state_dict.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if not key.endswith("weight"):
+                    continue
+                if value.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(value.dtype):
+                    total_estimate += 1
+
+            cls._otf_progress_total = max(1, int(total_estimate))
+            print(f"[INT8 OTF] Starting quantization scan (estimated layers: {cls._otf_progress_total})")
+
+        @classmethod
+        def _update_otf_progress(cls, *, quantized: bool, quarot: bool):
+            total = cls._otf_progress_total if cls._otf_progress_total is not None else 1
+            cls._otf_progress_processed += 1
+            if quantized:
+                cls._otf_progress_quantized += 1
+            if quarot:
+                cls._otf_progress_quarot += 1
+
+            percent = min(100, int((cls._otf_progress_processed * 100) / max(1, total)))
+            bucket = percent // 5
+            if bucket != cls._otf_progress_last_bucket:
+                cls._otf_progress_last_bucket = bucket
+                print(
+                    f"[INT8 OTF] {percent:3d}% "
+                    f"({cls._otf_progress_processed}/{total}) "
+                    f"quantized={cls._otf_progress_quantized} "
+                    f"quarot={cls._otf_progress_quarot}"
+                )
+
+        @classmethod
+        def summarize_otf_progress(cls):
+            if cls._otf_progress_processed <= 0:
+                return
+            print(
+                "[INT8 OTF] Complete "
+                f"(processed={cls._otf_progress_processed}, "
+                f"quantized={cls._otf_progress_quantized}, "
+                f"quarot={cls._otf_progress_quarot})"
+            )
         
         class Linear(manual_cast.Linear):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.register_buffer("weight_scale", None)
+                self.register_buffer("quarot_hadamard", None)
                 self._is_quantized = False
                 self._is_per_row = False
+                self._use_quarot = False
                 self.compute_dtype = torch.bfloat16
                 self.dynamic_lora_entries = None
                 self.lora_A = None
@@ -1003,6 +1205,8 @@ if _COMFY_OPS_AVAILABLE:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # Load Quantized
                         self._is_quantized = True
+                        self._use_quarot = False
+                        self.quarot_hadamard = None
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
@@ -1040,18 +1244,50 @@ if _COMFY_OPS_AVAILABLE:
                                         break
                             Int8TensorwiseOps._is_prequantized = is_prequant
 
+                        track_progress = Int8TensorwiseOps.dynamic_quantize and not Int8TensorwiseOps._is_prequantized
+                        if track_progress:
+                            Int8TensorwiseOps._init_otf_progress(state_dict)
+
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
+                        quantized_now = False
+                        quarot_now = False
                         
                         if is_excluded or is_dim1 or Int8TensorwiseOps._is_prequantized or not Int8TensorwiseOps.dynamic_quantize:
                             self._is_quantized = False
                             self._is_per_row = False
+                            self._use_quarot = False
+                            self.quarot_hadamard = None
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                             #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly (per-row, including FP8 -> INT8).
-                            device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
+                            device = _get_int8_compute_device(weight_tensor.device)
                             w_gpu = weight_tensor.to(device, non_blocking=True)
+                            if _is_float8_dtype(w_gpu.dtype):
+                                w_gpu = w_gpu.to(torch.float16 if device.type == "cuda" else torch.float32)
+                            elif Int8TensorwiseOps.enable_quarot and w_gpu.dtype in (torch.float16, torch.bfloat16):
+                                # Higher precision before Hadamard rotation generally improves OTF stability.
+                                w_gpu = w_gpu.float()
+                            self._use_quarot = False
+
+                            if (
+                                Int8TensorwiseOps.enable_quarot
+                                and _QUAROT_AVAILABLE
+                                and w_gpu.ndim == 2
+                                and w_gpu.shape[1] % _QUAROT_GROUP_SIZE == 0
+                            ):
+                                try:
+                                    h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=device, dtype=w_gpu.dtype)
+                                    w_gpu = _quarot_rotate_weight(w_gpu, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+                                    self._use_quarot = True
+                                    self.quarot_hadamard = h_matrix.detach().cpu()
+                                except Exception:
+                                    self._use_quarot = False
+                                    self.quarot_hadamard = None
+                            else:
+                                self.quarot_hadamard = None
+
                             q_weight, q_scale = quantize_int8_rowwise(w_gpu)
                             #print("Quantizing", prefix)
                             
@@ -1063,9 +1299,19 @@ if _COMFY_OPS_AVAILABLE:
                             )
                             self._is_quantized = True
                             self._is_per_row = self.weight_scale.dim() == 2 and self.weight_scale.shape[1] == 1
+                            quantized_now = True
+                            quarot_now = self._use_quarot
+
+                        if track_progress:
+                            Int8TensorwiseOps._update_otf_progress(
+                                quantized=quantized_now,
+                                quarot=quarot_now,
+                            )
                     else:
                         self._is_quantized = False
                         self._is_per_row = False
+                        self._use_quarot = False
+                        self.quarot_hadamard = None
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                 else:
                     missing_keys.append(weight_key)
@@ -1130,6 +1376,7 @@ if _COMFY_OPS_AVAILABLE:
                 else:
                     self.bias = nn.Parameter(new_bias, requires_grad=False)
 
+            @_disable_torch_compile
             def forward(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""
                 
@@ -1155,6 +1402,26 @@ if _COMFY_OPS_AVAILABLE:
                 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
+
+                if self._use_quarot and isinstance(self.quarot_hadamard, torch.Tensor):
+                    feature_count = x_2d.shape[-1]
+                    if feature_count % _QUAROT_GROUP_SIZE == 0:
+                        x_rotate = x_2d
+                        if x_rotate.device.type == "cpu" and x_rotate.dtype in (torch.float16, torch.bfloat16):
+                            x_rotate = x_rotate.float()
+
+                        h_matrix = self.quarot_hadamard
+                        if h_matrix.device != x_rotate.device or h_matrix.dtype != x_rotate.dtype:
+                            h_matrix = h_matrix.to(x_rotate.device, dtype=x_rotate.dtype, non_blocking=True)
+
+                        group_count = feature_count // _QUAROT_GROUP_SIZE
+                        x_grouped = x_rotate.reshape(-1, group_count, _QUAROT_GROUP_SIZE)
+                        x_rotated = torch.matmul(x_grouped, h_matrix)
+                        x_2d = x_rotated.reshape_as(x_rotate)
+                        if x_2d.dtype != x.dtype:
+                            x_2d = x_2d.to(x.dtype)
+
+                use_triton = bool(Int8TensorwiseOps.use_triton)
                 
                 small_batch_threshold = _get_small_batch_fallback_threshold(self)
                 use_small_batch_fallback = small_batch_threshold > 0 and x_2d.shape[0] <= small_batch_threshold
@@ -1165,9 +1432,23 @@ if _COMFY_OPS_AVAILABLE:
                     y = F.linear(x_2d, w_float, bias_typed)
                 else:
                     if self._is_per_row:
-                        y = int8_forward_dynamic_per_row(x_2d, weight, w_scale, bias, compute_dtype)
+                        y = int8_forward_dynamic_per_row(
+                            x_2d,
+                            weight,
+                            w_scale,
+                            bias,
+                            compute_dtype,
+                            use_triton=use_triton,
+                        )
                     else:
-                        y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
+                        y = int8_forward_dynamic(
+                            x_2d,
+                            weight,
+                            w_scale,
+                            bias,
+                            compute_dtype,
+                            use_triton=use_triton,
+                        )
                 
                 # Dynamic LoRA Path
                 y = apply_dynamic_lora_delta(

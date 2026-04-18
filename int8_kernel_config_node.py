@@ -54,20 +54,20 @@ class INT8KernelConfigTuner:
 	def INPUT_TYPES(s):
 		return {
 			"required": {
-				"model": ("MODEL",),
-				"run_microbench": ("BOOLEAN", {"default": False}),
-				"block_m": ("INT", {"default": 128, "min": 16, "max": 512, "step": 16}),
-				"block_n": ("INT", {"default": 128, "min": 16, "max": 512, "step": 16}),
-				"block_k": ("INT", {"default": 64, "min": 16, "max": 512, "step": 16}),
-				"group_size_m": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
-				"num_warps": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1}),
-				"num_stages": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1}),
-				"bench_m": ("INT", {"default": 2048, "min": 64, "max": 16384, "step": 64}),
-				"bench_k": ("INT", {"default": 4096, "min": 64, "max": 16384, "step": 64}),
-				"bench_n": ("INT", {"default": 4096, "min": 64, "max": 16384, "step": 64}),
-				"bench_warmup": ("INT", {"default": 2, "min": 1, "max": 20, "step": 1}),
-				"bench_iterations": ("INT", {"default": 6, "min": 2, "max": 100, "step": 1}),
-				"bench_include_scalar": ("BOOLEAN", {"default": False}),
+				"model": ("MODEL", {"tooltip": "INT8 model whose Triton kernel settings should be synchronized during sampling."}),
+				"run_microbench": ("BOOLEAN", {"default": False, "tooltip": "Benchmark candidate kernel settings now and use the fastest result for this model."}),
+				"block_m": ("INT", {"default": 128, "min": 16, "max": 512, "step": 16, "tooltip": "Triton BLOCK_M tile size for fixed INT8 matmul kernels."}),
+				"block_n": ("INT", {"default": 128, "min": 16, "max": 512, "step": 16, "tooltip": "Triton BLOCK_N tile size for fixed INT8 matmul kernels."}),
+				"block_k": ("INT", {"default": 64, "min": 16, "max": 512, "step": 16, "tooltip": "Triton BLOCK_K reduction tile size for fixed INT8 matmul kernels."}),
+				"group_size_m": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "Triton GROUP_SIZE_M launch grouping value for fixed INT8 matmul kernels."}),
+				"num_warps": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1, "tooltip": "Number of Triton warps per program for fixed INT8 matmul kernels."}),
+				"num_stages": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1, "tooltip": "Number of Triton pipeline stages for fixed INT8 matmul kernels."}),
+				"bench_m": ("INT", {"default": 2048, "min": 64, "max": 16384, "step": 64, "tooltip": "M dimension used by the optional synthetic kernel microbenchmark."}),
+				"bench_k": ("INT", {"default": 4096, "min": 64, "max": 16384, "step": 64, "tooltip": "K dimension used by the optional synthetic kernel microbenchmark."}),
+				"bench_n": ("INT", {"default": 4096, "min": 64, "max": 16384, "step": 64, "tooltip": "N dimension used by the optional synthetic kernel microbenchmark."}),
+				"bench_warmup": ("INT", {"default": 2, "min": 1, "max": 20, "step": 1, "tooltip": "Warmup iterations before timing each candidate kernel config."}),
+				"bench_iterations": ("INT", {"default": 6, "min": 2, "max": 100, "step": 1, "tooltip": "Timed iterations per candidate kernel config."}),
+				"bench_include_scalar": ("BOOLEAN", {"default": False, "tooltip": "Include scalar-weight kernel candidates in the benchmark. Usually leave off for per-row INT8 models."}),
 			}
 		}
 

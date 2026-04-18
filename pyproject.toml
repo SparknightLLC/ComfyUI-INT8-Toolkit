@@ -1,14 +1,14 @@
 # pyproject.toml
 [project]
-name = "comfyui-int8-fast-fork" # Unique identifier for your node. Immutable after creation.
-description = "Fork of node to load models in INT8 for 1.5~2X Speed gains on 30 series cards. Contains additional fixes and performance improvements."
-version = "0.0.1" # Custom node version. Must be semantically versioned.
-license = { file = "LICENSE.txt" }
-dependencies  = [] # Filled in from requirements.txt
+name = "comfyui-int8-fast-fork"
+description = "Standalone INT8 toolkit for ComfyUI with stock MODEL adapter support, unified INT8 LoRA nodes, and additional low-VRAM fixes."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = []
 
 [project.urls]
-Repository = "https://github.com/SparknightLLC/ComfyUI-INT8-Fast-Fork"
+Repository = "https://github.com/SparknightLLC/ComfyUI-INT8-Toolkit"
 
 [tool.comfy]
-PublisherId = "sparknight" # TODO (fill in Publisher ID from Comfy Registry Website).
-DisplayName = "ComfyUI-INT8-Fast-Fork" # Display name for the Custom Node. Can be changed later.
+PublisherId = "sparknight"
+DisplayName = "ComfyUI-INT8-Toolkit"

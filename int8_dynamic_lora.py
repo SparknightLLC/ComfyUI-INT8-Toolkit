@@ -47,6 +47,14 @@ def _resolve_target_module(model_patcher, key, module_cache=None):
     if module_cache is not None and layer_name in module_cache:
         return module_cache[layer_name]
 
+    try:
+        target_module = model_patcher.get_model_object(layer_name)
+        if module_cache is not None:
+            module_cache[layer_name] = target_module
+        return target_module
+    except Exception:
+        pass
+
     parts = layer_name.split(".")
     target_module = model_patcher.model.diffusion_model
     for part in parts[1:] if parts and parts[0] == "diffusion_model" else parts:
@@ -81,6 +89,7 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
             w_scale = target_module.weight_scale
             if isinstance(w_scale, torch.Tensor):
                 w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
+            use_quarot = bool(getattr(target_module, "_use_quarot", False))
 
             if _LORA_ADAPTER_AVAILABLE and isinstance(adapter, LoRAAdapter):
                 wrapped_patch_dict[key] = INT8LoRAPatchAdapter(
@@ -88,12 +97,14 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
                     adapter.weights,
                     w_scale,
                     seed=seed,
+                    use_quarot=use_quarot,
                 )
             else:
                 wrapped_patch_dict[key] = INT8WeightPatchAdapter(
                     adapter,
                     w_scale,
                     seed=seed,
+                    use_quarot=use_quarot,
                 )
         except Exception:
             wrapped_patch_dict[key] = adapter
@@ -128,9 +139,9 @@ class INT8DynamicLoraLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MODEL",),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
+                "model": ("MODEL", {"tooltip": "INT8 diffusion model to receive a runtime dynamic LoRA."}),
+                "lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "LoRA file from ComfyUI's loras folder."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01, "tooltip": "LoRA strength for the diffusion model. Negative values invert the LoRA effect."}),
             }
         }
 
@@ -151,8 +162,9 @@ class INT8DynamicLoraLoader:
         key_map = {}
         if model_patcher.model.model_type.name != "ModelType.CLIP":
             key_map = comfy.lora.model_lora_keys_unet(model_patcher.model, key_map)
-        
+
         patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
+        del lora
 
         dynamic_patch_dict = {}
         static_patch_dict = {}
@@ -161,7 +173,8 @@ class INT8DynamicLoraLoader:
                 dynamic_patch_dict[key] = adapter
             else:
                 static_patch_dict[key] = adapter
-        
+        del patch_dict
+
         # 2. Register Global Hook (if not exists)
         from .int8_quant import DynamicLoRAHook
         DynamicLoRAHook.register(model_patcher.model.diffusion_model)
@@ -199,13 +212,13 @@ class INT8DynamicLoraStack:
     @classmethod
     def INPUT_TYPES(s):
         inputs = {
-            "required": {"model": ("MODEL",)},
+            "required": {"model": ("MODEL", {"tooltip": "INT8 diffusion model to receive runtime dynamic LoRAs."})},
             "optional": {},
         }
         lora_list = ["None"] + folder_paths.get_filename_list("loras")
         for i in range(1, 11):
-            inputs["optional"][f"lora_{i}"] = (lora_list,)
-            inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01})
+            inputs["optional"][f"lora_{i}"] = (lora_list, {"tooltip": f"Optional dynamic LoRA slot {i}. Choose None to leave this slot unused."})
+            inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01, "tooltip": f"Strength for dynamic LoRA slot {i}. Ignored when the slot is None or strength is 0."})
         return inputs
 
     RETURN_TYPES = ("MODEL",)
@@ -245,6 +258,7 @@ class INT8DynamicLoraStack:
             lora_path = folder_paths.get_full_path("loras", lora_name)
             lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
             patch_dict = comfy.lora.load_lora(lora_data, key_map, log_missing=True)
+            del lora_data
 
             dynamic_patch_dict = {}
             static_patch_dict = {}
@@ -253,6 +267,7 @@ class INT8DynamicLoraStack:
                     dynamic_patch_dict[key] = adapter
                 else:
                     static_patch_dict[key] = adapter
+            del patch_dict
 
             if dynamic_patch_dict:
                 opts["dynamic_loras"].append({

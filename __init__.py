@@ -1,10 +1,11 @@
 """
-int88 - Fast INT8 Tensorwise Quantization for ComfyUI
+INT8 Toolkit - INT8 Tensorwise Quantization for ComfyUI
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
 - OTUNetLoaderW8A8: Load int8 quantized diffusion models
 - INT8LoraLoader / INT8LoraLoaderStack: Unified LoRA loaders with mode switching
+- INT8ModelAdapter: Enable INT8 on an existing MODEL
 
 Uses torch._int_mm for fast inference.
 """
@@ -62,9 +63,9 @@ def _register_layouts():
         )
         
     except ImportError:
-        logging.warning("Int88: ComfyUI Quantization system not found (Update ComfyUI?)")
+        logging.warning("INT8 Toolkit: ComfyUI Quantization system not found (Update ComfyUI?)")
     except Exception as e:
-        logging.error(f"Int88: Failed to register layouts: {e}")
+        logging.error(f"INT8 Toolkit: Failed to register layouts: {e}")
 
 
 # =============================================================================
@@ -86,9 +87,11 @@ try:
     from .int8_unet_loader import UNetLoaderINTW8A8
     from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
     from .int8_kernel_config_node import INT8KernelConfigTuner
-    
+    from .int8_model_adapter import INT8ModelAdapter
+
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
+        "INT8ModelAdapter": INT8ModelAdapter,
         "INT8LoraLoader": INT8LoraLoader,
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
         "INT8KernelConfigTuner": INT8KernelConfigTuner,
@@ -96,12 +99,13 @@ try:
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
+        "INT8ModelAdapter": "Enable INT8 on MODEL",
         "INT8LoraLoader": "Load LoRA INT8",
         "INT8LoraLoaderStack": "Load LoRA Stack INT8",
         "INT8KernelConfigTuner": "INT8 Kernel Config",
     }
 except ImportError as e:
-    logging.error(f"Int88: Failed to import nodes: {e}")
+    logging.error(f"INT8 Toolkit: Failed to import nodes: {e}")
     NODE_CLASS_MAPPINGS = {}
     NODE_DISPLAY_NAME_MAPPINGS = {}
 

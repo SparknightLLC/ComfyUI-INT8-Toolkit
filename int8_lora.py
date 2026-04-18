@@ -42,6 +42,13 @@ def _resolve_target_module_cached(model_patcher, key, module_cache):
 	if layer_name in module_cache:
 		return module_cache[layer_name]
 
+	try:
+		target_module = model_patcher.get_model_object(layer_name)
+		module_cache[layer_name] = target_module
+		return target_module
+	except Exception:
+		pass
+
 	parts = layer_name.split(".")
 	target_module = model_patcher.model.diffusion_model
 	for part in parts[1:] if parts and parts[0] == "diffusion_model" else parts:
@@ -81,15 +88,22 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache):
 
 			if is_quantized and _is_weight_adapter(adapter):
 				weight_scale = _get_weight_scale_for_module(target_module)
+				use_quarot = bool(getattr(target_module, "_use_quarot", False))
 				if _is_plain_lora_adapter(adapter):
 					new_adapter = INT8LoRAPatchAdapter(
 						adapter.loaded_keys,
 						adapter.weights,
 						weight_scale,
 						seed=seed,
+						use_quarot=use_quarot,
 					)
 				else:
-					new_adapter = INT8WeightPatchAdapter(adapter, weight_scale, seed=seed)
+					new_adapter = INT8WeightPatchAdapter(
+						adapter,
+						weight_scale,
+						seed=seed,
+						use_quarot=use_quarot,
+					)
 
 				final_patch_dict[key] = new_adapter
 				applied_count += 1
@@ -122,10 +136,10 @@ class INT8LoraLoader:
 	def INPUT_TYPES(s):
 		return {
 			"required": {
-				"mode": (["Stochastic", "Dynamic"],),
-				"model": ("MODEL",),
-				"lora_name": (folder_paths.get_filename_list("loras"),),
-				"strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+				"mode": (["Stochastic", "Dynamic"], {"tooltip": "Stochastic merges LoRA deltas into INT8 weights using stochastic rounding. Dynamic keeps compatible LoRAs as runtime additions without modifying INT8 weights."}),
+				"model": ("MODEL", {"tooltip": "INT8 or float diffusion model to receive the LoRA patch."}),
+				"lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "LoRA file from ComfyUI's loras folder."}),
+				"strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "LoRA strength for the diffusion model. Negative values invert the LoRA effect."}),
 			}
 		}
 
@@ -147,6 +161,7 @@ class INT8LoraLoader:
 		model_patcher = model.clone()
 		key_map = _get_key_map(model_patcher)
 		patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
+		del lora
 
 		module_cache = {}
 		final_patch_dict, applied_count = _upgrade_patch_dict_for_int8(
@@ -176,15 +191,15 @@ class INT8LoraLoaderStack:
 	def INPUT_TYPES(s):
 		inputs = {
 			"required": {
-				"mode": (["Stochastic", "Dynamic"],),
-				"model": ("MODEL",),
+				"mode": (["Stochastic", "Dynamic"], {"tooltip": "Stochastic combines stack deltas before one INT8 rounding step. Dynamic keeps compatible LoRAs as runtime additions."}),
+				"model": ("MODEL", {"tooltip": "INT8 or float diffusion model to receive the LoRA stack."}),
 			},
 			"optional": {}
 		}
 		lora_list = ["None"] + folder_paths.get_filename_list("loras")
 		for i in range(1, 11):
-			inputs["optional"][f"lora_{i}"] = (lora_list,)
-			inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01})
+			inputs["optional"][f"lora_{i}"] = (lora_list, {"tooltip": f"Optional LoRA slot {i}. Choose None to leave this slot unused."})
+			inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": f"Strength for LoRA slot {i}. Ignored when the slot is None or strength is 0."})
 		return inputs
 
 	RETURN_TYPES = ("MODEL",)
@@ -214,6 +229,7 @@ class INT8LoraLoaderStack:
 		layered_patches = {}
 		for data, strength, _name in all_loras:
 			patch_dict = comfy.lora.load_lora(data, key_map, log_missing=True)
+			del data
 			for key, adapter in patch_dict.items():
 				if key not in layered_patches:
 					layered_patches[key] = []
@@ -235,9 +251,15 @@ class INT8LoraLoaderStack:
 					continue
 
 				weight_scale = _get_weight_scale_for_module(target_module)
+				use_quarot = bool(getattr(target_module, "_use_quarot", False))
 				mergeable = all(hasattr(adapter, "calculate_weight") for adapter, _ in patches)
 				if mergeable:
-					final_patch_dict[key] = INT8MergedLoRAPatchAdapter(patches, weight_scale, seed=seed)
+					final_patch_dict[key] = INT8MergedLoRAPatchAdapter(
+						patches,
+						weight_scale,
+						seed=seed,
+						use_quarot=use_quarot,
+					)
 					applied_count += 1
 				else:
 					for adapter, adapter_strength in patches:
