@@ -117,7 +117,7 @@ class INT8KernelConfigTuner:
 		if run_microbench:
 			try:
 				print(
-					f"[ComfyUI-Flux2-INT8] Running kernel microbench "
+					f"[ComfyUI-INT8-Toolkit] Running kernel microbench "
 					f"(M={bench_m}, K={bench_k}, N={bench_n}, warmup={bench_warmup}, iters={bench_iterations})..."
 				)
 				best_config, results = int8_fused_kernel.microbench_fixed_kernel_configs(
@@ -130,7 +130,7 @@ class INT8KernelConfigTuner:
 					extra_candidates=[manual_config],
 				)
 				selected_config = best_config
-				print("[ComfyUI-Flux2-INT8] Microbench results (top 3):")
+				print("[ComfyUI-INT8-Toolkit] Microbench results (top 3):")
 				for row in results[:3]:
 					print(f"  avg_ms={row['avg_ms']:.3f} config={row['config']}")
 			except Exception as e:
@@ -151,7 +151,7 @@ class INT8KernelConfigTuner:
 
 		_ensure_kernel_config_wrapper(model_patcher)
 
-		print("[ComfyUI-Flux2-INT8] Recommended environment variables for persistent config:")
+		print("[ComfyUI-INT8-Toolkit] Recommended environment variables for persistent config:")
 		for line in int8_fused_kernel.format_kernel_config_env_lines(applied_config):
 			print(f"  {line}")
 

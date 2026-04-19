@@ -117,6 +117,57 @@ def _is_excluded(module_name, excluded_names):
 	return any(excluded_name in module_name for excluded_name in excluded_names)
 
 
+def _is_comfy_quantized_tensor(value):
+	return (
+		isinstance(value, torch.Tensor)
+		and callable(getattr(value, "dequantize", None))
+		and (
+			bool(getattr(value, "is_quantized", False))
+			or hasattr(value, "_qdata")
+			or hasattr(value, "_layout_cls")
+			or hasattr(value, "params")
+		)
+	)
+
+
+def _is_linear_like(module):
+	if isinstance(module, nn.Linear):
+		return True
+	if module.__class__.__name__ != "Linear":
+		return False
+	return (
+		hasattr(module, "in_features")
+		and hasattr(module, "out_features")
+		and hasattr(module, "weight")
+		and callable(getattr(module, "forward", None))
+	)
+
+
+def _is_supported_weight_tensor(weight):
+	if not isinstance(weight, torch.Tensor):
+		return False
+	if weight.ndim != 2:
+		return False
+	if weight.shape[0] <= 1 or weight.shape[1] <= 1:
+		return False
+	if _is_comfy_quantized_tensor(weight):
+		return True
+	return weight.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight.dtype)
+
+
+def _materialize_source_weight(weight, device=None, dtype=None):
+	if _is_comfy_quantized_tensor(weight):
+		weight = weight.dequantize()
+	if device is not None or dtype is not None:
+		to_kwargs = {"copy": True}
+		if device is not None:
+			to_kwargs["device"] = device
+		if dtype is not None:
+			to_kwargs["dtype"] = dtype
+		weight = weight.to(**to_kwargs)
+	return weight.detach()
+
+
 def _marker_in_module_names(module_names, marker):
 	return any(marker in module_name for module_name in module_names)
 
@@ -187,16 +238,10 @@ def _is_supported_linear(module):
 		return False
 	if getattr(module, "_is_quantized", False):
 		return False
-	if not isinstance(module, nn.Linear):
+	if not _is_linear_like(module):
 		return False
 	weight = getattr(module, "weight", None)
-	if not isinstance(weight, torch.Tensor):
-		return False
-	if weight.ndim != 2:
-		return False
-	if weight.shape[0] <= 1 or weight.shape[1] <= 1:
-		return False
-	return weight.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight.dtype)
+	return _is_supported_weight_tensor(weight)
 
 
 def _collect_layer_patch_keys(model_patcher, module_name):
@@ -209,7 +254,7 @@ def _collect_layer_patch_keys(model_patcher, module_name):
 
 
 def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
-	weight = module.weight.detach()
+	weight = _materialize_source_weight(module.weight)
 	weight_key = _module_weight_key(module_name)
 	layer_patch_keys = _collect_layer_patch_keys(model_patcher, module_name)
 
@@ -224,7 +269,7 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 	if intermediate_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
 		intermediate_dtype = torch.float16
 
-	work_weight = weight.to(compute_device, dtype=intermediate_dtype, copy=True)
+	work_weight = _materialize_source_weight(weight, device=compute_device, dtype=intermediate_dtype)
 	layer_patches = []
 	for patch_key in layer_patch_keys:
 		layer_patches.extend(model_patcher.patches.get(patch_key, []))
