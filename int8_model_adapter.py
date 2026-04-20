@@ -172,7 +172,20 @@ def _marker_in_module_names(module_names, marker):
 	return any(marker in module_name for module_name in module_names)
 
 
+def _is_sdxl_diffusion_model(diffusion_model):
+	for module_name, module in diffusion_model.named_modules():
+		if not module_name.startswith("label_emb"):
+			continue
+		in_features = getattr(module, "in_features", None)
+		if in_features in (2560, 2816):
+			return True
+	return False
+
+
 def _infer_model_type_from_modules(diffusion_model):
+	if _is_sdxl_diffusion_model(diffusion_model):
+		return "sdxl"
+
 	module_names = [
 		module_name
 		for module_name, _module in diffusion_model.named_modules()

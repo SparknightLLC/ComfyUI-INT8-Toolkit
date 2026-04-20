@@ -8,7 +8,7 @@ from .int8_quant import (
 )
 
 
-MODEL_TYPE_CHOICES = ["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"]
+MODEL_TYPE_CHOICES = ["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima", "sdxl"]
 DEFAULT_OUTLIER_METHOD = OUTLIER_METHOD_NONE
 
 
@@ -41,6 +41,10 @@ def get_model_type_exclusions(model_type):
     if model_type == "anima":
         return [
             "embed", "llm", "blocks.0.", "blocks.1.", "blocks.2.",
+        ]
+    if model_type == "sdxl":
+        return [
+            "time_embed", "label_emb", "emb_layers", "proj_in", "proj_out",
         ]
     if model_type == "wan":
         return [

@@ -89,6 +89,10 @@ Supported `model_type` presets:
 - `qwen`
 - `ernie`
 - `anima`
+- `sdxl` ()
+
+> [!NOTE]
+> SDXL can be slower with INT8 enabled because we only quantize linear layers while SDXL still spends substantial time in convolutional UNet blocks, attention kernels, and other non-INT8 work. Larger transformer-heavy architectures are more likely to see a speedup.
 
 ### Enable INT8 on MODEL
 
@@ -184,6 +188,8 @@ Windows works fine with a compatible Triton build.
 ## Performance Notes
 
 Upstream reported roughly 1.5x to 2x faster inference on an RTX 3090 depending on model, settings, and whether Torch compile is effective. INT8 is most useful on GPUs with strong INT8 throughput. It is not guaranteed to beat native FP8 paths on newer cards.
+
+Architecture matters: compact or convolution-heavy models such as SDXL may run slower after W8A8 conversion because dynamic activation quantization and dequantization overhead can outweigh the saved linear matmul time.
 
 ## Credits
 
