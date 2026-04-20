@@ -89,7 +89,7 @@ Supported `model_type` presets:
 - `qwen`
 - `ernie`
 - `anima`
-- `sdxl` ()
+- `sdxl`
 
 > [!NOTE]
 > SDXL can be slower with INT8 enabled because we only quantize linear layers while SDXL still spends substantial time in convolutional UNet blocks, attention kernels, and other non-INT8 work. Larger transformer-heavy architectures are more likely to see a speedup.
