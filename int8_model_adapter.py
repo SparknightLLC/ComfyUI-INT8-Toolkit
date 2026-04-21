@@ -27,6 +27,13 @@ from .int8_unet_loader import OUTLIER_METHOD_CHOICES
 from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
 from .int8_unet_loader import get_model_type_exclusions
 
+try:
+	import comfy_api.torch_helpers.torch_compile as comfy_torch_compile
+	_TORCH_COMPILE_HELPER_AVAILABLE = True
+except Exception:
+	comfy_torch_compile = None
+	_TORCH_COMPILE_HELPER_AVAILABLE = False
+
 
 AUTO_MODEL_TYPE = "auto"
 NONE_MODEL_TYPE = "none"
@@ -531,6 +538,36 @@ def _ensure_int8_model_adapter_notice_wrapper(model_patcher):
 	)
 
 
+def _refresh_torch_compile_wrapper(model_patcher):
+	if not _TORCH_COMPILE_HELPER_AVAILABLE:
+		return False
+
+	compile_kwargs = model_patcher.model_options.get(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
+	model_patcher.remove_wrappers_with_key(
+		comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+		comfy_torch_compile.COMPILE_KEY,
+	)
+
+	if not isinstance(compile_kwargs, dict):
+		model_patcher.model_options.pop(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
+		return False
+
+	backend = compile_kwargs.get("backend", None)
+	if not backend:
+		model_patcher.model_options.pop(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
+		return False
+
+	comfy_torch_compile.set_torch_compile_wrapper(
+		model=model_patcher,
+		backend=backend,
+		options=compile_kwargs.get("options", None),
+		mode=compile_kwargs.get("mode", None),
+		fullgraph=compile_kwargs.get("fullgraph", False),
+		dynamic=compile_kwargs.get("dynamic", None),
+	)
+	return True
+
+
 def _collect_int8_candidates(diffusion_model, excluded_names):
 	return [
 		(module_name, module)
@@ -716,6 +753,7 @@ class INT8ModelAdapter:
 			"skipped_patched_layers": skipped_patched_count,
 		}
 		setattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", True)
+		compile_wrapper_refreshed = _refresh_torch_compile_wrapper(model_patcher)
 		_ensure_int8_model_adapter_notice_wrapper(model_patcher)
 		model_patcher.patches_uuid = uuid.uuid4()
 		_cleanup_torch_memory()
@@ -726,6 +764,8 @@ class INT8ModelAdapter:
 				f"(quantized={quantized}, baked_patches={baked_lora_count}, "
 				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count})"
 			)
+			if compile_wrapper_refreshed:
+				print("[INT8 Model Adapter] Refreshed torch.compile wrapper after requantization.")
 
 		return (model_patcher,)
 
