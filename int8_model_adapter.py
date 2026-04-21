@@ -39,6 +39,7 @@ AUTO_MODEL_TYPE = "auto"
 NONE_MODEL_TYPE = "none"
 MODEL_TYPE_CHOICES = [AUTO_MODEL_TYPE] + LOADER_MODEL_TYPE_CHOICES + [NONE_MODEL_TYPE]
 _INT8_MODEL_ADAPTER_WRAPPER_KEY = "int8_model_adapter_cache_notice"
+_INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY = "int8_model_adapter_original_modules"
 
 MODEL_TYPE_FINGERPRINTS = {
 	"flux2": (
@@ -538,34 +539,16 @@ def _ensure_int8_model_adapter_notice_wrapper(model_patcher):
 	)
 
 
-def _refresh_torch_compile_wrapper(model_patcher):
+def _drop_torch_compile_wrapper(model_patcher):
 	if not _TORCH_COMPILE_HELPER_AVAILABLE:
 		return False
 
-	compile_kwargs = model_patcher.model_options.get(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
+	compile_kwargs = model_patcher.model_options.pop(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
 	model_patcher.remove_wrappers_with_key(
 		comfy.patcher_extension.WrappersMP.APPLY_MODEL,
 		comfy_torch_compile.COMPILE_KEY,
 	)
-
-	if not isinstance(compile_kwargs, dict):
-		model_patcher.model_options.pop(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
-		return False
-
-	backend = compile_kwargs.get("backend", None)
-	if not backend:
-		model_patcher.model_options.pop(comfy_torch_compile.TORCH_COMPILE_KWARGS, None)
-		return False
-
-	comfy_torch_compile.set_torch_compile_wrapper(
-		model=model_patcher,
-		backend=backend,
-		options=compile_kwargs.get("options", None),
-		mode=compile_kwargs.get("mode", None),
-		fullgraph=compile_kwargs.get("fullgraph", False),
-		dynamic=compile_kwargs.get("dynamic", None),
-	)
-	return True
+	return isinstance(compile_kwargs, dict)
 
 
 def _collect_int8_candidates(diffusion_model, excluded_names):
@@ -578,6 +561,37 @@ def _collect_int8_candidates(diffusion_model, excluded_names):
 	]
 
 
+def _get_original_module_cache(model_patcher):
+	shared_model = getattr(model_patcher, "model", None)
+	original_module_cache = getattr(shared_model, _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY, None)
+	if isinstance(original_module_cache, dict):
+		model_patcher.set_attachments(_INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY, original_module_cache)
+		return original_module_cache
+
+	original_module_cache = model_patcher.get_attachment(_INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY)
+	if isinstance(original_module_cache, dict):
+		if shared_model is not None:
+			setattr(shared_model, _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY, original_module_cache)
+		return original_module_cache
+
+	original_module_cache = {}
+	if shared_model is not None:
+		setattr(shared_model, _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY, original_module_cache)
+	model_patcher.set_attachments(_INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY, original_module_cache)
+	return original_module_cache
+
+
+def _remember_original_linear_modules(model_patcher, candidates):
+	original_module_cache = _get_original_module_cache(model_patcher)
+
+	for module_name, module in candidates:
+		if isinstance(module, Int8TensorwiseOps.Linear):
+			continue
+
+		patch_key = _module_patch_key(module_name)
+		original_module_cache.setdefault(patch_key, module)
+
+
 def _clear_prior_int8_object_patches(model_patcher):
 	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
 		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
@@ -586,6 +600,14 @@ def _clear_prior_int8_object_patches(model_patcher):
 
 def _reset_prior_int8_object_patches(model_patcher):
 	int8_patch_keys = set()
+	original_module_cache = _get_original_module_cache(model_patcher)
+
+	for patch_key, patch_obj in list(model_patcher.object_patches_backup.items()):
+		if not patch_key.startswith("diffusion_model."):
+			continue
+		if isinstance(patch_obj, Int8TensorwiseOps.Linear):
+			continue
+		original_module_cache.setdefault(patch_key, patch_obj)
 
 	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
 		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
@@ -600,6 +622,18 @@ def _reset_prior_int8_object_patches(model_patcher):
 			model_patcher.unpatch_model(unpatch_weights=False)
 		except Exception as e:
 			logging.warning(f"INT8 Model Adapter: failed to fully reset prior INT8 object patches ({e}).")
+
+	for patch_key, original_module in list(original_module_cache.items()):
+		try:
+			current_module = comfy.utils.get_attr(model_patcher.model, patch_key)
+		except Exception:
+			continue
+
+		if not isinstance(current_module, Int8TensorwiseOps.Linear):
+			continue
+
+		comfy.utils.set_attr(model_patcher.model, patch_key, original_module)
+		int8_patch_keys.add(patch_key)
 
 	for patch_key in list(model_patcher.object_patches.keys()):
 		if patch_key in int8_patch_keys:
@@ -670,6 +704,9 @@ class INT8ModelAdapter:
 				candidates = _collect_int8_candidates(diffusion_model, excluded_names)
 			except Exception as e:
 				logging.warning(f"INT8 Model Adapter: forced model load failed during candidate scan ({e}).")
+
+		if candidates:
+			_remember_original_linear_modules(model_patcher, candidates)
 
 		total = len(candidates)
 		quantized = 0
@@ -753,7 +790,7 @@ class INT8ModelAdapter:
 			"skipped_patched_layers": skipped_patched_count,
 		}
 		setattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", True)
-		compile_wrapper_refreshed = _refresh_torch_compile_wrapper(model_patcher)
+		compile_wrapper_removed = _drop_torch_compile_wrapper(model_patcher)
 		_ensure_int8_model_adapter_notice_wrapper(model_patcher)
 		model_patcher.patches_uuid = uuid.uuid4()
 		_cleanup_torch_memory()
@@ -764,8 +801,8 @@ class INT8ModelAdapter:
 				f"(quantized={quantized}, baked_patches={baked_lora_count}, "
 				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count})"
 			)
-			if compile_wrapper_refreshed:
-				print("[INT8 Model Adapter] Refreshed torch.compile wrapper after requantization.")
+			if compile_wrapper_removed:
+				print("[INT8 Model Adapter] Removed torch.compile wrapper after requantization.")
 
 		return (model_patcher,)
 
