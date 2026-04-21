@@ -266,13 +266,113 @@ def _collect_layer_patch_keys(model_patcher, module_name):
 	]
 
 
+def _is_deferred_int8_stochastic_patch(patch_entry):
+	if not isinstance(patch_entry, tuple) or len(patch_entry) < 2:
+		return False
+	return bool(getattr(patch_entry[1], "_int8_defer_until_quantized", False))
+
+
+def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys):
+	bake_patches = []
+	consumed_patch_keys = []
+	deferred_patch_keys = []
+	remaining_patch_entries = {}
+
+	for patch_key in layer_patch_keys:
+		patch_entries = model_patcher.patches.get(patch_key, [])
+		bake_entries = []
+		deferred_entries = []
+
+		for patch_entry in patch_entries:
+			if _is_deferred_int8_stochastic_patch(patch_entry):
+				deferred_entries.append(patch_entry)
+			else:
+				bake_entries.append(patch_entry)
+
+		if bake_entries:
+			bake_patches.extend(bake_entries)
+			if deferred_entries:
+				deferred_patch_keys.append(patch_key)
+				remaining_patch_entries[patch_key] = deferred_entries
+			else:
+				consumed_patch_keys.append(patch_key)
+		elif deferred_entries:
+			deferred_patch_keys.append(patch_key)
+
+	return bake_patches, consumed_patch_keys, deferred_patch_keys, remaining_patch_entries
+
+
+def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_module):
+	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
+
+	weight_scale = getattr(q_module, "weight_scale", None)
+	if isinstance(weight_scale, torch.Tensor):
+		weight_scale = weight_scale.item() if weight_scale.numel() == 1 else weight_scale
+
+	outlier_method = getattr(q_module, "_outlier_method", None)
+	hadanorm_sigma = getattr(q_module, "hadanorm_sigma", None)
+
+	for patch_key in deferred_patch_keys:
+		patch_entries = model_patcher.patches.get(patch_key, [])
+		if not patch_entries:
+			continue
+
+		updated_entries = []
+		for patch_entry in patch_entries:
+			if not _is_deferred_int8_stochastic_patch(patch_entry):
+				updated_entries.append(patch_entry)
+				continue
+
+			strength_patch, patch_obj, strength_model, offset, function = patch_entry
+			if isinstance(patch_obj, INT8MergedLoRAPatchAdapter):
+				configured_patch_obj = INT8MergedLoRAPatchAdapter(
+					patch_obj.patches,
+					weight_scale,
+					seed=patch_obj.seed,
+					outlier_method=outlier_method,
+					hadanorm_sigma=hadanorm_sigma,
+				)
+			elif isinstance(patch_obj, INT8WeightPatchAdapter):
+				configured_patch_obj = INT8WeightPatchAdapter(
+					patch_obj.base_adapter,
+					weight_scale,
+					seed=patch_obj.seed,
+					outlier_method=outlier_method,
+					hadanorm_sigma=hadanorm_sigma,
+				)
+			elif isinstance(patch_obj, INT8LoRAPatchAdapter):
+				configured_patch_obj = INT8LoRAPatchAdapter(
+					patch_obj.loaded_keys,
+					patch_obj.weights,
+					weight_scale,
+					seed=patch_obj.seed,
+					outlier_method=outlier_method,
+					hadanorm_sigma=hadanorm_sigma,
+				)
+			else:
+				updated_entries.append(patch_entry)
+				continue
+
+			updated_entries.append((strength_patch, configured_patch_obj, strength_model, offset, function))
+
+		model_patcher.patches[patch_key] = updated_entries
+
+
 def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 	weight = _materialize_source_weight(module.weight)
 	weight_key = _module_weight_key(module_name)
 	layer_patch_keys = _collect_layer_patch_keys(model_patcher, module_name)
 
 	if not bake_loaded_loras or not layer_patch_keys:
-		return weight, []
+		return weight, [], [], {}
+
+	bake_patches, consumed_patch_keys, deferred_patch_keys, remaining_patch_entries = _build_layer_patch_bake_plan(
+		model_patcher,
+		layer_patch_keys,
+	)
+
+	if not bake_patches:
+		return weight, [], deferred_patch_keys, remaining_patch_entries
 
 	compute_device = _get_int8_compute_device(weight.device)
 	try:
@@ -283,16 +383,13 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 		intermediate_dtype = torch.float16
 
 	work_weight = _materialize_source_weight(weight, device=compute_device, dtype=intermediate_dtype)
-	layer_patches = []
-	for patch_key in layer_patch_keys:
-		layer_patches.extend(model_patcher.patches.get(patch_key, []))
 	patched_weight = comfy.lora.calculate_weight(
-		layer_patches,
+		bake_patches,
 		work_weight,
 		weight_key,
 		intermediate_dtype=intermediate_dtype,
 	)
-	return patched_weight.detach(), layer_patch_keys
+	return patched_weight.detach(), consumed_patch_keys, deferred_patch_keys, remaining_patch_entries
 
 
 def _quantize_linear_module(module_name, module, source_weight, outlier_method):
@@ -450,28 +547,32 @@ def _clear_prior_int8_object_patches(model_patcher):
 			model_patcher.object_patches.pop(patch_key, None)
 
 
-def _restore_applied_int8_object_patches(model_patcher):
-	restored_count = 0
-	for patch_key, backup_obj in list(model_patcher.object_patches_backup.items()):
-		if not patch_key.startswith("diffusion_model."):
-			continue
+def _reset_prior_int8_object_patches(model_patcher):
+	int8_patch_keys = set()
 
+	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
+		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
+			int8_patch_keys.add(patch_key)
+
+	for patch_key in list(model_patcher.object_patches_backup.keys()):
+		if patch_key.startswith("diffusion_model."):
+			int8_patch_keys.add(patch_key)
+
+	if int8_patch_keys:
 		try:
-			current_obj = comfy.utils.get_attr(model_patcher.model, patch_key)
-		except Exception:
-			continue
-
-		if not isinstance(current_obj, Int8TensorwiseOps.Linear):
-			continue
-
-		try:
-			comfy.utils.set_attr(model_patcher.model, patch_key, backup_obj)
-			model_patcher.object_patches_backup.pop(patch_key, None)
-			restored_count += 1
+			model_patcher.unpatch_model(unpatch_weights=False)
 		except Exception as e:
-			logging.warning(f"INT8 Model Adapter: failed to restore prior INT8 object patch {patch_key} ({e}).")
+			logging.warning(f"INT8 Model Adapter: failed to fully reset prior INT8 object patches ({e}).")
 
-	return restored_count
+	for patch_key in list(model_patcher.object_patches.keys()):
+		if patch_key in int8_patch_keys:
+			model_patcher.object_patches.pop(patch_key, None)
+
+	for patch_key in list(model_patcher.object_patches_backup.keys()):
+		if patch_key in int8_patch_keys:
+			model_patcher.object_patches_backup.pop(patch_key, None)
+
+	return len(int8_patch_keys)
 
 
 class INT8ModelAdapter:
@@ -508,7 +609,7 @@ class INT8ModelAdapter:
 			return (model,)
 
 		model_patcher = model.clone()
-		restored_prior_patch_count = _restore_applied_int8_object_patches(model_patcher)
+		restored_prior_patch_count = _reset_prior_int8_object_patches(model_patcher)
 		_clear_prior_int8_object_patches(model_patcher)
 		diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
 		if diffusion_model is None:
@@ -552,7 +653,7 @@ class INT8ModelAdapter:
 					skipped_patched_count += 1
 					continue
 
-				source_weight, baked_patch_keys = _get_source_weight(
+				source_weight, baked_patch_keys, deferred_patch_keys, remaining_patch_entries = _get_source_weight(
 					model_patcher,
 					module_name,
 					module,
@@ -565,6 +666,9 @@ class INT8ModelAdapter:
 					outlier_method,
 				)
 				model_patcher.add_object_patch(_module_patch_key(module_name), q_module)
+				for patch_key, patch_entries in remaining_patch_entries.items():
+					model_patcher.patches[patch_key] = patch_entries
+				_configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_module)
 				quantized += 1
 				if used_quarot:
 					quarot_count += 1
@@ -572,6 +676,8 @@ class INT8ModelAdapter:
 					for patch_key in baked_patch_keys:
 						model_patcher.patches.pop(patch_key, None)
 					baked_lora_count += len(baked_patch_keys)
+				if remaining_patch_entries:
+					baked_lora_count += len(remaining_patch_entries)
 				del source_weight
 			except Exception as e:
 				logging.warning(f"INT8 Model Adapter: skipped {module_name} ({e}).")

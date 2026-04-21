@@ -1,5 +1,7 @@
 # ComfyUI-INT8-Toolkit
 
+INT8 quantization stores model weights in 8-bit integers instead of higher-precision formats, which can reduce VRAM use and speed up matrix-heavy inference on GPUs with strong INT8 throughput. This is particularly helpful with 30-series Nvidia cards. The tradeoff is that quantization changes the numerical representation of the model, so quality, compatibility, and patching behavior need to be handled deliberately.
+
 This project began as a fork of [ComfyUI-INT8-Fast](https://github.com/BobJohnson24/ComfyUI-INT8-Fast), but it is now maintained as its own INT8 solution for ComfyUI rather than a mere compatibility branch.
 
 ![workflow](example_workflows/load_workflow.png)
@@ -8,7 +10,7 @@ This codebase has its own workflow model, node surface, adapter behavior, and pe
 
 The main differentiator is `Enable INT8 on MODEL`: a `MODEL -> MODEL` node that can convert a model loaded by ComfyUI's stock diffusion loader into this extension's INT8 runtime. That lets standard diffusion loaders and stock LoRA loaders remain part of the workflow, then INT8 can be enabled after those patches are in place.
 
-Other notable differences from upstream include unified INT8 LoRA nodes with selectable stochastic or dynamic behavior, safer adapter fallback handling, runtime kernel tuning controls, and additional stock-loader compatibility work.
+Other notable differences from upstream include unified INT8 LoRA nodes with selectable standard, stochastic, or dynamic behavior, safer adapter fallback handling, runtime kernel tuning controls, and additional stock-loader compatibility work.
 
 Tested primarily with FLUX.2 Klein and Z-Image style models. Other architectures may need different exclusion presets or quality checks.
 
@@ -53,6 +55,7 @@ INT8 model
 
 - `Stochastic`: applies the LoRA delta into INT8 weights with stochastic rounding.
 - `Dynamic`: keeps compatible plain LoRAs as runtime additions instead of modifying INT8 weights.
+- `Standard`: applies the LoRA through ComfyUI's regular MODEL patch path without INT8-specific handling. This is useful for pre-INT8 A/B testing against `Stochastic`.
 
 ## LoRA Order And VRAM Behavior
 
@@ -61,12 +64,14 @@ Some LoRA orders can temporarily materialize large float tensors. On lower-VRAM 
 | LoRA method | Before `Enable INT8 on MODEL` | After `Enable INT8 on MODEL` | Notes |
 | --- | --- | --- | --- |
 | Stock `Load LoRA` | Best stock-loader path. The LoRA is baked by `Enable INT8 on MODEL` when `bake_loaded_loras` is enabled. | Avoid for INT8 layers unless testing. ComfyUI's generic patch path may dequantize or build large temporary tensors. | Easiest compatibility path before INT8. Riskier after INT8 because it is not INT8-aware. |
-| `Load LoRA INT8` with `Stochastic` | Works, but on a non-INT8 model it mostly behaves like a stock LoRA patch until `Enable INT8 on MODEL` bakes it. | Preferred for adding LoRAs after INT8. Plain LoRA adapters use INT8-aware stochastic patching. | Still needs a temporary LoRA delta per patched layer. Very large LoRAs or non-plain adapters can spike memory. |
+| `Load LoRA INT8` with `Standard` | Equivalent to a stock-style MODEL-only LoRA patch. Useful when you want the same node surface before INT8 and plan to bake later with `Enable INT8 on MODEL`. | Mainly for testing. It intentionally skips INT8-specific handling, so post-INT8 behavior follows ComfyUI's generic patch path. | Best fit for fast A/B comparisons against `Stochastic` on an existing pre-INT8 LoRA stack. |
+| `Load LoRA INT8` with `Stochastic` | Carries deferred INT8-aware patches so `Enable INT8 on MODEL` can quantize the base layer first, then apply the LoRA with stochastic INT8 rounding. | Preferred for adding LoRAs after INT8. Plain LoRA adapters use INT8-aware stochastic patching. | This is the mode to compare against `Standard` when you want pre-INT8 A/B testing with the same node surface. |
 | `Load LoRA INT8` with `Dynamic` | Not the preferred order. Dynamic LoRA state is intended for an INT8 runtime path, and baking behavior is less direct than stock LoRA patches. | Preferred when the LoRA is compatible and you can accept slower runtime. Compatible plain LoRAs are applied during forward passes. | Avoids permanently changing INT8 weights, but adds runtime matmuls. Unsupported formats fall back to static-safe patching and can spike like stochastic mode. |
 
 Practical guidance:
 
 - For stock workflows, put stock `Load LoRA` before `Enable INT8 on MODEL`.
+- If you want to A/B the same `Load LoRA INT8` or `Load LoRA Stack INT8` graph before INT8 conversion, switch `mode` between `Standard` and `Stochastic`.
 - For already-INT8 workflows, use `Load LoRA INT8` after INT8 is enabled.
 - If a graph OOMs during LoRA application but not during sampling, try the other INT8 LoRA mode, reduce the LoRA stack, or bake the LoRA before INT8 conversion.
 - Leave `bake_loaded_loras` enabled unless you intentionally want patched layers skipped by the adapter.
@@ -120,15 +125,15 @@ If `auto` cannot identify the architecture, the adapter uses a conservative unio
 
 ### Load LoRA INT8
 
-Loads one LoRA with selectable `Stochastic` or `Dynamic` mode.
+Loads one LoRA with selectable `Stochastic`, `Dynamic`, or `Standard` mode.
 
-`Stochastic` mode is the speed-oriented path. `Dynamic` mode can preserve more of the original LoRA math for compatible plain LoRAs, but it is slower because extra LoRA matmuls run during inference.
+`Stochastic` mode is the speed-oriented INT8 path and can now be queued before `Enable INT8 on MODEL` without collapsing into the same bake behavior as `Standard`. `Dynamic` mode can preserve more of the original LoRA math for compatible plain LoRAs, but it is slower because extra LoRA matmuls run during inference. `Standard` mode uses ComfyUI's regular MODEL LoRA patching without INT8-specific wrapping.
 
 ### Load LoRA Stack INT8
 
 Loads up to 10 LoRAs with the same mode behavior as `Load LoRA INT8`.
 
-In `Stochastic` mode, compatible LoRAs are combined before one stochastic rounding step. This is usually better than repeatedly rounding each LoRA one by one.
+In `Stochastic` mode, compatible LoRAs are combined before one stochastic rounding step. This is usually better than repeatedly rounding each LoRA one by one. In `Standard` mode, the stack behaves like chaining stock MODEL-only LoRA patches.
 
 ### INT8 Kernel Config
 
