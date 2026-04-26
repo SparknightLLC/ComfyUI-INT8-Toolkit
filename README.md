@@ -194,8 +194,6 @@ Recommended defaults:
 - Use `dynamic=true` when changing image size or batch shape. Try `dynamic=false` only for fixed workflows.
 - After source-code hot reloads or failed compile experiments, restart ComfyUI before drawing conclusions. TorchDynamo guards and generated kernels can outlive local Python edits inside the same process.
 
-If you launch ComfyUI through this project's `run.bat`, TorchInductor and Triton compile artifacts are stored under the local `torch_compile_cache` directory.
-
 ## ModelSave Round Trip
 
 If you quantize with `on_the_fly_quantization` and save with ComfyUI `ModelSave`, the saved checkpoint can be loaded back with `Load Diffusion Model INT8 (W8A8)` without re-quantizing as long as the checkpoint includes INT8 `weight` tensors and matching `weight_scale` tensors.
@@ -228,7 +226,7 @@ Additional checkpoints:
 - PyTorch build compatible with your ComfyUI install
 - `triton-windows` for the optional fused Triton backend on Windows
 
-Windows note: use the Triton build that matches your PyTorch/CUDA stack. In the tested Comfy Anaconda environment, PyTorch `2.8.0+cu126` imports Triton `3.4.0` from `triton-windows 3.4.0.post21`.
+Windows note: use the Triton build that matches your PyTorch/CUDA stack. In my tested Comfy Anaconda environment, PyTorch `2.8.0+cu126` imports Triton `3.4.0` from `triton-windows 3.4.0.post21`.
 
 ## Recent Development Changes
 
