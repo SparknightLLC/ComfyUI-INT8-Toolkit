@@ -13,6 +13,12 @@ from .int8_quant import (
 	OUTLIER_METHOD_HADANORM,
 	OUTLIER_METHOD_NONE,
 	OUTLIER_METHOD_QUAROT,
+	INT8_BACKEND_CHOICES,
+	DEFAULT_INT8_BACKEND,
+	INT8_BACKEND_TRITON,
+	INT8_BACKEND_TRITON_LEGACY_UNSAFE,
+	SMALL_BATCH_FALLBACK_CHOICES,
+	DEFAULT_SMALL_BATCH_FALLBACK,
 	_QUAROT_AVAILABLE,
 	_QUAROT_GROUP_SIZE,
 	_compute_hadanorm_sigma,
@@ -442,6 +448,7 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 		device=torch.device("meta"),
 	)
 	q_module.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+	q_module.weight_packed = q_module.weight.detach().T.contiguous() if Int8TensorwiseOps.prepack_int8_weights else None
 	q_module.weight_scale = (
 		q_scale.cpu()
 		if isinstance(q_scale, torch.Tensor)
@@ -509,6 +516,16 @@ def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 	base_model = executor.class_obj
 	diffusion_model = getattr(base_model, "diffusion_model", None)
 
+	if isinstance(adapter_state, dict):
+		runtime_backend = adapter_state.get("runtime_backend", DEFAULT_INT8_BACKEND)
+		if runtime_backend not in INT8_BACKEND_CHOICES:
+			runtime_backend = DEFAULT_INT8_BACKEND
+		Int8TensorwiseOps.runtime_backend = runtime_backend
+		Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+		Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
+		Int8TensorwiseOps.small_batch_fallback_mode = adapter_state.get("small_batch_fallback", DEFAULT_SMALL_BATCH_FALLBACK)
+		Int8TensorwiseOps.prepack_int8_weights = bool(adapter_state.get("prepack_int8_weights", False))
+
 	if isinstance(adapter_state, dict) and adapter_state.get("log_progress") and diffusion_model is not None:
 		if getattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", False):
 			diffusion_model._int8_model_adapter_skip_cache_notice_once = False
@@ -516,15 +533,22 @@ def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 		elif _is_first_sampling_step(transformer_options):
 			if not getattr(diffusion_model, "_int8_model_adapter_notice_in_generation", False):
 				print(
-					"[INT8 Model Adapter] Reusing cached INT8 MODEL output "
+					"\n[INT8 Model Adapter] Reusing cached INT8 MODEL output "
 					f"(quantized_layers={adapter_state.get('quantized_layers', '?')}, "
-					f"model_type={adapter_state.get('model_type', '?')})."
+					f"model_type={adapter_state.get('model_type', '?')}, "
+					f"backend={adapter_state.get('runtime_backend', '?')}, "
+					f"small_batch_fallback={adapter_state.get('small_batch_fallback', '?')}, "
+					f"prepack_int8_weights={adapter_state.get('prepack_int8_weights', '?')})."
 				)
+				Int8TensorwiseOps.reset_runtime_stats()
 				diffusion_model._int8_model_adapter_notice_in_generation = True
 		else:
 			diffusion_model._int8_model_adapter_notice_in_generation = False
 
-	return executor(*args, **kwargs)
+	result = executor(*args, **kwargs)
+	if isinstance(adapter_state, dict):
+		Int8TensorwiseOps.print_runtime_stats()
+	return result
 
 
 def _ensure_int8_model_adapter_notice_wrapper(model_patcher):
@@ -654,9 +678,11 @@ class INT8ModelAdapter:
 				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to this extension's INT8 linear runtime."}),
 				"enable_int8": ("BOOLEAN", {"default": True, "tooltip": "Disable this to pass the input model through unchanged without removing the node from a workflow."}),
 				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. Use none only for experiments."}),
-				"bake_loaded_loras": ("BOOLEAN", {"default": True, "tooltip": "Apply existing stock LoRA weight patches, including sliced patches, before quantization, then remove the consumed patches to avoid applying them twice. If disabled, layers with pending patches are left unquantized."}),
 				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
-				"use_triton": ("BOOLEAN", {"default": True, "tooltip": "Use this extension's Triton INT8 matmul kernels when available; disable for troubleshooting or fallback benchmarking."}),
+				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
+				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
+				"prepack_int8_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental: keep an extra transposed INT8 weight buffer for Triton so output columns are read contiguously. May improve speed but adds roughly one extra INT8 copy of each quantized weight."}),
+				"bake_loaded_loras": ("BOOLEAN", {"default": True, "tooltip": "Apply existing stock LoRA weight patches, including sliced patches, before quantization, then remove the consumed patches to avoid applying them twice. If disabled, layers with pending patches are left unquantized."}),
 				"log_progress": ("BOOLEAN", {"default": True, "tooltip": "Print quantization progress and layer counts to the ComfyUI console."}),
 			}
 		}
@@ -671,10 +697,13 @@ class INT8ModelAdapter:
 		model,
 		enable_int8,
 		model_type,
-		bake_loaded_loras,
 		outlier_method,
-		use_triton,
-		log_progress,
+		small_batch_fallback=DEFAULT_SMALL_BATCH_FALLBACK,
+		runtime_backend=DEFAULT_INT8_BACKEND,
+		prepack_int8_weights=False,
+		bake_loaded_loras=True,
+		log_progress=True,
+		use_triton=None,
 	):
 		if not enable_int8:
 			return (model,)
@@ -692,7 +721,13 @@ class INT8ModelAdapter:
 			diffusion_model,
 			bool(log_progress),
 		)
-		Int8TensorwiseOps.use_triton = bool(use_triton)
+		if runtime_backend not in INT8_BACKEND_CHOICES:
+			runtime_backend = DEFAULT_INT8_BACKEND
+		Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
+		Int8TensorwiseOps.runtime_backend = runtime_backend
+		Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+		Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
+		Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
 
 		candidates = _collect_int8_candidates(diffusion_model, excluded_names)
 		if not candidates:
@@ -782,7 +817,9 @@ class INT8ModelAdapter:
 			"requested_model_type": model_type,
 			"bake_loaded_loras": bool(bake_loaded_loras),
 			"outlier_method": outlier_method,
-			"use_triton": bool(use_triton),
+			"small_batch_fallback": small_batch_fallback,
+			"runtime_backend": runtime_backend,
+			"prepack_int8_weights": bool(prepack_int8_weights),
 			"log_progress": bool(log_progress),
 			"quantized_layers": quantized,
 			"baked_lora_layers": baked_lora_count,
@@ -799,7 +836,9 @@ class INT8ModelAdapter:
 			print(
 				"[INT8 Model Adapter] Complete "
 				f"(quantized={quantized}, baked_patches={baked_lora_count}, "
-				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count})"
+				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count}, "
+				f"backend={runtime_backend}, small_batch_fallback={small_batch_fallback}, "
+				f"prepack_int8_weights={bool(prepack_int8_weights)})"
 			)
 			if compile_wrapper_removed:
 				print("[INT8 Model Adapter] Removed torch.compile wrapper after requantization.")

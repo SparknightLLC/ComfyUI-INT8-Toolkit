@@ -3,12 +3,18 @@ import folder_paths
 
 from .int8_quant import (
     Int8TensorwiseOps,
+    INT8_BACKEND_CHOICES,
+    DEFAULT_INT8_BACKEND,
+    INT8_BACKEND_TRITON,
+    INT8_BACKEND_TRITON_LEGACY_UNSAFE,
     OUTLIER_METHOD_CHOICES,
     OUTLIER_METHOD_NONE,
+    SMALL_BATCH_FALLBACK_CHOICES,
+    DEFAULT_SMALL_BATCH_FALLBACK,
 )
 
 
-MODEL_TYPE_CHOICES = ["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima", "sdxl"]
+MODEL_TYPE_CHOICES = ["anima", "chroma", "ernie", "flux2", "ltx2", "qwen", "sdxl", "wan", "z-image"]
 DEFAULT_OUTLIER_METHOD = OUTLIER_METHOD_NONE
 
 
@@ -77,6 +83,9 @@ class UNetLoaderINTW8A8:
                 "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights to INT8 during loading. Leave off for already-quantized INT8 checkpoints."}),
                 "outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply during on-the-fly INT8 quantization. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
+                "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
+                "runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
+                "prepack_int8_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental: keep an extra transposed INT8 weight buffer for Triton so output columns are read contiguously. May improve speed but adds roughly one extra INT8 copy of each quantized weight."}),
             }
         }
 
@@ -85,7 +94,17 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, outlier_method=DEFAULT_OUTLIER_METHOD):
+    def load_unet(
+        self,
+        unet_name,
+        weight_dtype,
+        model_type,
+        on_the_fly_quantization,
+        outlier_method=DEFAULT_OUTLIER_METHOD,
+        small_batch_fallback=DEFAULT_SMALL_BATCH_FALLBACK,
+        runtime_backend=DEFAULT_INT8_BACKEND,
+        prepack_int8_weights=False,
+    ):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         # Use Int8TensorwiseOps for proper direct int8 loading
@@ -102,10 +121,17 @@ class UNetLoaderINTW8A8:
         from comfy.sd import load_diffusion_model
         
         # Set quantization flags for this load
+        if runtime_backend not in INT8_BACKEND_CHOICES:
+            runtime_backend = DEFAULT_INT8_BACKEND
         Int8TensorwiseOps.excluded_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
         Int8TensorwiseOps.outlier_method = outlier_method if on_the_fly_quantization else DEFAULT_OUTLIER_METHOD
         Int8TensorwiseOps.use_triton = True
+        Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
+        Int8TensorwiseOps.runtime_backend = runtime_backend
+        Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+        Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
+        Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
         Int8TensorwiseOps._is_prequantized = False
         Int8TensorwiseOps.reset_otf_progress()
         

@@ -48,9 +48,33 @@ try:
 except ValueError:
     _SMALL_BATCH_FALLBACK_MIN_ROWS = 2
 
+try:
+    _SMALL_LAYER_MAX_PARAMS = max(1, int(os.environ.get("INT8_SMALL_LAYER_MAX_PARAMS", "1000000")))
+except ValueError:
+    _SMALL_LAYER_MAX_PARAMS = 1_000_000
+
 _ADAPTIVE_SMALL_BATCH_FALLBACK = os.environ.get("INT8_SMALL_BATCH_FALLBACK_ADAPTIVE", "1") == "1"
 _DYNAMIC_LORA_DEBUG = os.environ.get("INT8_DYNAMIC_LORA_DEBUG", "0") == "1"
 _DYNAMIC_LORA_BATCH = os.environ.get("INT8_DYNAMIC_LORA_BATCH", "1") == "1"
+_RUNTIME_STATS_ENABLED = os.environ.get("INT8_RUNTIME_STATS", "0") == "1"
+SMALL_BATCH_FALLBACK_NEVER = "never"
+SMALL_BATCH_FALLBACK_SMALL_LAYERS = "only_small_layers"
+SMALL_BATCH_FALLBACK_ALWAYS = "always"
+SMALL_BATCH_FALLBACK_CHOICES = [
+    SMALL_BATCH_FALLBACK_SMALL_LAYERS,
+    SMALL_BATCH_FALLBACK_ALWAYS,
+    SMALL_BATCH_FALLBACK_NEVER,
+]
+DEFAULT_SMALL_BATCH_FALLBACK = SMALL_BATCH_FALLBACK_SMALL_LAYERS
+INT8_BACKEND_TRITON = "triton"
+INT8_BACKEND_TRITON_LEGACY_UNSAFE = "triton_legacy_unsafe"
+INT8_BACKEND_TORCH_INT_MM = "torch_int_mm"
+INT8_BACKEND_CHOICES = [
+    INT8_BACKEND_TORCH_INT_MM,
+    INT8_BACKEND_TRITON,
+    INT8_BACKEND_TRITON_LEGACY_UNSAFE,
+]
+DEFAULT_INT8_BACKEND = INT8_BACKEND_TORCH_INT_MM
 OUTLIER_METHOD_NONE = "none"
 OUTLIER_METHOD_QUAROT = "quarot"
 OUTLIER_METHOD_HADANORM = "hadanorm"
@@ -153,6 +177,36 @@ def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
         scale = scale.to(q.device, non_blocking=True)
     return q.float() * scale
 
+def _prepack_int8_weight(weight: Tensor | None):
+    if not isinstance(weight, torch.Tensor) or weight.dtype != torch.int8 or weight.ndim != 2:
+        return None
+    return weight.detach().T.contiguous()
+
+def _get_prepacked_weight(linear_module, device: torch.device):
+    packed = getattr(linear_module, "weight_packed", None)
+    if not isinstance(packed, torch.Tensor):
+        return None
+    if packed.device != device:
+        packed = packed.to(device, non_blocking=True)
+    return packed
+
+def _torch_int_mm_safe(a: Tensor, b: Tensor) -> Tensor:
+    rows = int(a.shape[0])
+    columns = int(b.shape[1])
+
+    if a.is_cuda and a.shape[0] <= 16:
+        pad_rows = 17 - rows
+        if pad_rows > 0:
+            padding = torch.zeros((pad_rows, a.shape[1]), device=a.device, dtype=a.dtype)
+            a = torch.cat((a, padding), dim=0)
+
+    if b.is_cuda and (columns % 8) != 0:
+        pad_columns = 8 - (columns % 8)
+        padding = torch.zeros((b.shape[0], pad_columns), device=b.device, dtype=b.dtype)
+        b = torch.cat((b, padding), dim=1)
+
+    return torch._int_mm(a, b)[:rows, :columns]
+
 def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
     """
     Quantize a delta tensor to INT8 using stochastic rounding.
@@ -192,12 +246,16 @@ def int8_forward_dynamic(
     bias: Tensor | None,
     compute_dtype: torch.dtype,
     use_triton: bool = True,
+    weight_packed: Tensor | None = None,
+    legacy_triton_unsafe: bool = False,
 ) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
     
     # --- FAST PATH: Triton Fused Kernel ---
     if _TRITON_AVAILABLE and use_triton and x.is_cuda:
-        return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
+        if isinstance(weight_packed, torch.Tensor):
+            return triton_int8_linear(x, weight_packed, weight_scale, bias, compute_dtype, weight_is_prepacked=True, legacy_unsafe=legacy_triton_unsafe)
+        return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype, legacy_unsafe=legacy_triton_unsafe)
 
     # --- SLOW PATH: Standard PyTorch ---
     # Quantize activations per row (dynamic)
@@ -206,7 +264,7 @@ def int8_forward_dynamic(
         weight_scale = weight_scale.to(x.device, non_blocking=True)
     
     # INT8 Matmul (Outputs Int32)
-    res = torch._int_mm(x_8, weight.T)
+    res = _torch_int_mm_safe(x_8, weight.T)
     
     # Dequantize: (res * weight_scale * x_scale)
     # Note: Creating intermediate Float tensors here is VRAM heavy
@@ -225,12 +283,16 @@ def int8_forward_dynamic_per_row(
     bias: Tensor | None,
     compute_dtype: torch.dtype,
     use_triton: bool = True,
+    weight_packed: Tensor | None = None,
+    legacy_triton_unsafe: bool = False,
 ) -> Tensor:
     """Forward with dynamic per-token activation quantization and per-row weight quantization."""
 
     # --- FAST PATH: Triton Fused Kernel (per-row) ---
     if _TRITON_AVAILABLE and use_triton and x.is_cuda:
-        return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype)
+        if isinstance(weight_packed, torch.Tensor):
+            return triton_int8_linear_per_row(x, weight_packed, weight_scale, bias, compute_dtype, weight_is_prepacked=True, legacy_unsafe=legacy_triton_unsafe)
+        return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype, legacy_unsafe=legacy_triton_unsafe)
 
     # --- SLOW PATH: Standard PyTorch ---
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
@@ -238,7 +300,7 @@ def int8_forward_dynamic_per_row(
         weight_scale = weight_scale.to(x.device, non_blocking=True)
 
     # INT8 Matmul (Outputs Int32)
-    res = torch._int_mm(x_8, weight.T)
+    res = _torch_int_mm_safe(x_8, weight.T)
 
     # Dequantize with per-row weight scales
     # res[i, j] = sum_k(x_8[i, k] * weight[j, k]) * x_scale[i] * weight_scale[j]
@@ -324,6 +386,12 @@ def _can_batch_dynamic_entries(prepared_entries, output_length: int | None):
     return True
 
 def _get_small_batch_fallback_threshold(linear_module) -> int:
+    mode = getattr(Int8TensorwiseOps, "small_batch_fallback_mode", SMALL_BATCH_FALLBACK_SMALL_LAYERS)
+    if mode not in SMALL_BATCH_FALLBACK_CHOICES:
+        mode = SMALL_BATCH_FALLBACK_SMALL_LAYERS
+    if mode == SMALL_BATCH_FALLBACK_NEVER:
+        return 0
+
     base_rows = _SMALL_BATCH_FALLBACK_MAX_ROWS
     if base_rows <= 0:
         return 0
@@ -338,6 +406,8 @@ def _get_small_batch_fallback_threshold(linear_module) -> int:
     out_features = int(weight.shape[0])
     in_features = int(weight.shape[1])
     matmul_size = out_features * in_features
+    if mode == SMALL_BATCH_FALLBACK_SMALL_LAYERS and matmul_size > _SMALL_LAYER_MAX_PARAMS:
+        return 0
 
     rows = base_rows
     if matmul_size >= 12_000_000:
@@ -1075,14 +1145,37 @@ class DynamicLoRAHook:
     def _compute_lora_id(dynamic_loras):
         if not dynamic_loras:
             return None
-        # Use stable values so per-step dict/list cloning does not force recompose.
-        return hash(tuple(
-            (
+
+        signature = []
+        # Prefer a loader-created UUID so cloned dicts keep a stable identity while
+        # newly loaded or changed LoRA stacks force recomposition.
+        for entry in dynamic_loras:
+            patch_uuid = entry.get("patch_uuid", None)
+            if patch_uuid is not None:
+                signature.append((str(patch_uuid), float(entry.get("strength", 0.0))))
+                continue
+
+            patches = entry.get("patches", {})
+            if isinstance(patches, dict):
+                patch_items = tuple(
+                    sorted(
+                        (
+                            str(raw_key),
+                            id(adapter),
+                        )
+                        for raw_key, adapter in patches.items()
+                    )
+                )
+            else:
+                patch_items = ()
+            signature.append((
                 entry.get("name", ""),
                 float(entry.get("strength", 0.0)),
-                len(entry.get("patches", {})),
-            )
-            for entry in dynamic_loras
+                patch_items,
+            ))
+
+        return hash(tuple(
+            signature
         ))
 
     @classmethod
@@ -1290,12 +1383,18 @@ if _COMFY_OPS_AVAILABLE:
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
         outlier_method = OUTLIER_METHOD_NONE
         use_triton = True
+        runtime_backend = DEFAULT_INT8_BACKEND
+        runtime_uses_triton = DEFAULT_INT8_BACKEND in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+        runtime_uses_legacy_triton = False
+        prepack_int8_weights = False
+        small_batch_fallback_mode = SMALL_BATCH_FALLBACK_SMALL_LAYERS
         _is_prequantized = None # Global flag for current load
         _otf_progress_total = None
         _otf_progress_processed = 0
         _otf_progress_quantized = 0
         _otf_progress_outlier = 0
         _otf_progress_last_bucket = -1
+        _runtime_stats = {}
 
         @classmethod
         def reset_otf_progress(cls):
@@ -1352,11 +1451,47 @@ if _COMFY_OPS_AVAILABLE:
                 f"quantized={cls._otf_progress_quantized}, "
                 f"outlier_adjusted={cls._otf_progress_outlier})"
             )
+
+        @classmethod
+        def reset_runtime_stats(cls):
+            cls._runtime_stats = {
+                "linear_calls": 0,
+                "triton": 0,
+                "triton_legacy_unsafe": 0,
+                "torch_int_mm": 0,
+                "small_batch_fallback": 0,
+                "prepacked": 0,
+            }
+
+        @classmethod
+        def _increment_runtime_stat(cls, key):
+            if not _RUNTIME_STATS_ENABLED:
+                return
+            try:
+                if torch.compiler.is_compiling():
+                    return
+            except Exception:
+                pass
+            if not cls._runtime_stats:
+                cls.reset_runtime_stats()
+            cls._runtime_stats[key] = cls._runtime_stats.get(key, 0) + 1
+
+        @classmethod
+        def print_runtime_stats(cls, prefix="[INT8 Runtime]"):
+            if not _RUNTIME_STATS_ENABLED:
+                return
+            print(
+                f"{prefix} backend={cls.runtime_backend} "
+                f"small_batch_fallback={cls.small_batch_fallback_mode} "
+                f"prepack_int8_weights={cls.prepack_int8_weights} "
+                f"calls={cls._runtime_stats}"
+            )
         
         class Linear(manual_cast.Linear):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.register_buffer("weight_scale", None)
+                self.register_buffer("weight_packed", None)
                 self.register_buffer("quarot_hadamard", None)
                 self.register_buffer("hadanorm_sigma", None)
                 self._is_quantized = False
@@ -1398,6 +1533,7 @@ if _COMFY_OPS_AVAILABLE:
                         self.hadanorm_sigma = None
                         self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        self.weight_packed = _prepack_int8_weight(weight_tensor) if Int8TensorwiseOps.prepack_int8_weights else None
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
                         if isinstance(weight_scale, torch.Tensor):
@@ -1460,6 +1596,7 @@ if _COMFY_OPS_AVAILABLE:
                             self.hadanorm_sigma = None
                             self._outlier_method = OUTLIER_METHOD_NONE
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                            self.weight_packed = None
                             #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly (per-row, including FP8 -> INT8).
@@ -1501,6 +1638,7 @@ if _COMFY_OPS_AVAILABLE:
                             #print("Quantizing", prefix)
                             
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+                            self.weight_packed = _prepack_int8_weight(self.weight) if Int8TensorwiseOps.prepack_int8_weights else None
                             self.weight_scale = (
                                 q_scale.cpu()
                                 if isinstance(q_scale, torch.Tensor)
@@ -1524,6 +1662,7 @@ if _COMFY_OPS_AVAILABLE:
                         self.hadanorm_sigma = None
                         self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        self.weight_packed = None
                 else:
                     missing_keys.append(weight_key)
                 
@@ -1532,6 +1671,17 @@ if _COMFY_OPS_AVAILABLE:
                     self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                 else:
                     self.bias = None
+
+            def _replace_weight(self, new_weight, inplace_update=False):
+                if inplace_update:
+                    self.weight.data.copy_(new_weight)
+                else:
+                    self.weight = nn.Parameter(new_weight, requires_grad=False)
+                self.weight_packed = (
+                    _prepack_int8_weight(self.weight)
+                    if self._is_quantized and Int8TensorwiseOps.prepack_int8_weights
+                    else None
+                )
 
             def convert_weight(self, _weight, inplace=False):
                 if not self._is_quantized:
@@ -1548,9 +1698,9 @@ if _COMFY_OPS_AVAILABLE:
                         return new_weight
 
                     if inplace_update:
-                        self.weight.data.copy_(new_weight)
+                        self._replace_weight(new_weight, inplace_update=True)
                     else:
-                        self.weight = nn.Parameter(new_weight, requires_grad=False)
+                        self._replace_weight(new_weight)
                     return
 
                 if out_weight.dtype == torch.int8:
@@ -1558,9 +1708,9 @@ if _COMFY_OPS_AVAILABLE:
                         return out_weight
 
                     if inplace_update:
-                        self.weight.data.copy_(out_weight)
+                        self._replace_weight(out_weight, inplace_update=True)
                     else:
-                        self.weight = nn.Parameter(out_weight, requires_grad=False)
+                        self._replace_weight(out_weight)
                     return
 
                 # Re-quantize if fallback occurred
@@ -1570,9 +1720,9 @@ if _COMFY_OPS_AVAILABLE:
                     return new_weight
 
                 if inplace_update:
-                    self.weight.data.copy_(new_weight)
+                    self._replace_weight(new_weight, inplace_update=True)
                 else:
-                    self.weight = nn.Parameter(new_weight, requires_grad=False)
+                    self._replace_weight(new_weight)
 
             def set_bias(self, out_bias, inplace_update=False, seed=0, return_weight=False, **kwargs):
                 if out_bias is None: return None
@@ -1621,7 +1771,13 @@ if _COMFY_OPS_AVAILABLE:
                 )
                 x_2d = x_transformed.reshape(-1, x_shape[-1])
 
-                use_triton = bool(Int8TensorwiseOps.use_triton)
+                use_triton = Int8TensorwiseOps.runtime_uses_triton
+                legacy_triton_unsafe = Int8TensorwiseOps.runtime_uses_legacy_triton
+                weight_packed = (
+                    _get_prepacked_weight(self, x.device)
+                    if use_triton and Int8TensorwiseOps.prepack_int8_weights
+                    else None
+                )
                 
                 small_batch_threshold = _get_small_batch_fallback_threshold(self)
                 use_small_batch_fallback = small_batch_threshold > 0 and x_2d.shape[0] <= small_batch_threshold
@@ -1634,11 +1790,24 @@ if _COMFY_OPS_AVAILABLE:
                     matmul_bias = None
 
                 if use_small_batch_fallback:
+                    Int8TensorwiseOps._increment_runtime_stat("linear_calls")
+                    Int8TensorwiseOps._increment_runtime_stat("small_batch_fallback")
                     # Small batch fallback
                     w_float = dequantize(weight, w_scale).to(input_2d.dtype)
                     bias_typed = matmul_bias.to(input_2d.dtype) if matmul_bias is not None else None
                     y = F.linear(input_2d, w_float, bias_typed)
                 else:
+                    Int8TensorwiseOps._increment_runtime_stat("linear_calls")
+                    if use_triton:
+                        if legacy_triton_unsafe:
+                            Int8TensorwiseOps._increment_runtime_stat("triton_legacy_unsafe")
+                        else:
+                            Int8TensorwiseOps._increment_runtime_stat("triton")
+                        if isinstance(weight_packed, torch.Tensor):
+                            Int8TensorwiseOps._increment_runtime_stat("prepacked")
+                    else:
+                        Int8TensorwiseOps._increment_runtime_stat("torch_int_mm")
+
                     if self._is_per_row:
                         y = int8_forward_dynamic_per_row(
                             input_2d,
@@ -1647,6 +1816,8 @@ if _COMFY_OPS_AVAILABLE:
                             matmul_bias,
                             compute_dtype,
                             use_triton=use_triton,
+                            weight_packed=weight_packed,
+                            legacy_triton_unsafe=legacy_triton_unsafe,
                         )
                     else:
                         y = int8_forward_dynamic(
@@ -1656,6 +1827,8 @@ if _COMFY_OPS_AVAILABLE:
                             matmul_bias,
                             compute_dtype,
                             use_triton=use_triton,
+                            weight_packed=weight_packed,
+                            legacy_triton_unsafe=legacy_triton_unsafe,
                         )
 
                 if correction_2d is not None:

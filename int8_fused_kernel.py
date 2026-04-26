@@ -276,6 +276,9 @@ def triton_quantize_rowwise(x: torch.Tensor):
     Input: [Batch, Dim] (float16/bfloat16/float32)
     Output: [Batch, Dim] (int8), [Batch, 1] (float32)
     """
+	if not x.is_contiguous():
+		x = x.contiguous()
+
 	rows, cols = x.shape
 	y = torch.empty_like(x, dtype=torch.int8)
 	s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
@@ -324,7 +327,9 @@ def _int8_matmul_dequant_kernel(
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
-        HAS_BIAS: tl.constexpr):
+        HAS_BIAS: tl.constexpr,
+        HAS_MN_TAIL: tl.constexpr,
+        LEGACY_UNSAFE: tl.constexpr):
 	"""
     Computes: C = ((A * B) * (scale_a * scale_b)) + bias
     A: [M, K] int8
@@ -342,8 +347,12 @@ def _int8_matmul_dequant_kernel(
 
 	# 1. Prepare Pointers for A and B
 	# A block pointer: [BLOCK_M, BLOCK_K]
-	offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-	offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+	if LEGACY_UNSAFE:
+		offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+		offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+	else:
+		offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+		offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 	offs_k = tl.arange(0, BLOCK_K)
 
 	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -354,8 +363,16 @@ def _int8_matmul_dequant_kernel(
 
 	for k in range(0, tl.cdiv(K, BLOCK_K)):
 		# Load chunks
-		a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-		b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+		k_mask = offs_k < K - k * BLOCK_K
+		if LEGACY_UNSAFE:
+			a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+		elif HAS_MN_TAIL:
+			a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
+		else:
+			a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
 
 		# Matrix Multiply (Int8 inputs -> Int32 accum)
 		accumulator += tl.dot(a, b)
@@ -368,7 +385,12 @@ def _int8_matmul_dequant_kernel(
 
 	# Load dynamic scales
 	# A Scale is per-row [M, 1]
-	scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+	if LEGACY_UNSAFE:
+		scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+	elif HAS_MN_TAIL:
+		scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < M, other=0.0)  # Vector [BLOCK_M]
+	else:
+		scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
 
 	# B Scale is scalar or tensor.
 	scale_b = tl.load(b_scale_ptr)
@@ -383,12 +405,22 @@ def _int8_matmul_dequant_kernel(
 
 	# Add Bias if present
 	if HAS_BIAS:
-		bias = tl.load(bias_ptr + offs_bn)  # Vector [BLOCK_N]
+		if LEGACY_UNSAFE:
+			bias = tl.load(bias_ptr + offs_bn)  # Vector [BLOCK_N]
+		elif HAS_MN_TAIL:
+			bias = tl.load(bias_ptr + offs_bn, mask=offs_bn < N, other=0.0)  # Vector [BLOCK_N]
+		else:
+			bias = tl.load(bias_ptr + offs_bn)  # Vector [BLOCK_N]
 		c = c + bias[None, :]
 
 	# 4. Store Result (Cast to output dtype, usually FP16)
 	c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-	c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	if LEGACY_UNSAFE:
+		c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	elif HAS_MN_TAIL:
+		c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	else:
+		c_mask = True
 
 	# We write as fp16 or bf16 implicitly by the pointer type, but explicit cast is safer
 	tl.store(c_ptrs, c, mask=c_mask)
@@ -399,7 +431,7 @@ def _int8_matmul_dequant_kernel(
 # =============================================================================
 
 
-def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias=None, compute_dtype=torch.float16):
+def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias=None, compute_dtype=torch.float16, weight_is_prepacked: bool = False, legacy_unsafe: bool = False):
 	"""
     Fused pipeline for W8A8 Linear Layer.
     """
@@ -408,7 +440,7 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
 	x_2d = x.reshape(-1, x_shape_orig[-1])
 
 	M, K = x_2d.shape
-	N = weight.shape[0]
+	N = weight.shape[1] if weight_is_prepacked else weight.shape[0]
 
 	# 2. Kernel 1: Dynamic Activation Quantization
 	#    (This is much faster than Python-loop based axiswise quant)
@@ -430,21 +462,28 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
 	# Check if we have bias
 	has_bias = bias is not None
 	bias_ptr = bias if has_bias else x  # Dummy pointer if None
-	launch_kwargs = {"HAS_BIAS": has_bias}
+	launch_kwargs = {"HAS_BIAS": has_bias, "HAS_MN_TAIL": True, "LEGACY_UNSAFE": bool(legacy_unsafe)}
 	if not _ENABLE_TRITON_AUTOTUNE:
+		has_mn_tail = (M % _FIXED_KERNEL_CONFIG["BLOCK_M"]) != 0 or (N % _FIXED_KERNEL_CONFIG["BLOCK_N"]) != 0
 		launch_kwargs.update({
 			"BLOCK_M": _FIXED_KERNEL_CONFIG["BLOCK_M"],
 			"BLOCK_N": _FIXED_KERNEL_CONFIG["BLOCK_N"],
 			"BLOCK_K": _FIXED_KERNEL_CONFIG["BLOCK_K"],
 			"GROUP_SIZE_M": _FIXED_KERNEL_CONFIG["GROUP_SIZE_M"],
+			"HAS_MN_TAIL": has_mn_tail,
+			"LEGACY_UNSAFE": bool(legacy_unsafe),
 			"num_warps": _FIXED_KERNEL_CONFIG["num_warps"],
 			"num_stages": _FIXED_KERNEL_CONFIG["num_stages"],
 		})
 
-	# NOTE: PyTorch Linear weights are [Out, In] (N, K).
-	# The kernel expects B to be [K, N] logically.
-	# Since weight is [N, K], we can treat it as [K, N] TRANSPOSED.
-	# Stride of W is [K, 1]. To read as column-major [K, N], stride is [1, K].
+	if weight_is_prepacked:
+		stride_bk = weight.stride(0)
+		stride_bn = weight.stride(1)
+	else:
+		# PyTorch Linear weights are [Out, In] (N, K). The kernel expects B as
+		# [K, N], so ordinary weights are read through transposed strides.
+		stride_bk = weight.stride(1)
+		stride_bn = weight.stride(0)
 
 	_int8_matmul_dequant_kernel[grid](
 	    # Pointers
@@ -461,8 +500,8 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
 	    # Strides
 	    stride_am=x_int8.stride(0),
 	    stride_ak=x_int8.stride(1),
-	    stride_bk=weight.stride(1),
-	    stride_bn=weight.stride(0),  # Transposed access of W
+	    stride_bk=stride_bk,
+	    stride_bn=stride_bn,
 	    stride_cm=output.stride(0),
 	    stride_cn=output.stride(1),
 	    # Meta
@@ -503,7 +542,9 @@ def _int8_matmul_dequant_per_row_kernel(
 		BLOCK_N: tl.constexpr,
 		BLOCK_K: tl.constexpr,
 		GROUP_SIZE_M: tl.constexpr,
-		HAS_BIAS: tl.constexpr):
+		HAS_BIAS: tl.constexpr,
+		HAS_MN_TAIL: tl.constexpr,
+		LEGACY_UNSAFE: tl.constexpr):
 	"""
 	Computes: C = ((A * B) * (scale_a[:, None] * scale_b[None, :])) + bias
 	A: [M, K] int8, scale_a: [M, 1] per-row activation scales
@@ -520,8 +561,12 @@ def _int8_matmul_dequant_per_row_kernel(
 	pid_n = (pid % num_pid_in_group) // group_size_m
 
 	# 1. Prepare Pointers for A and B
-	offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-	offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+	if LEGACY_UNSAFE:
+		offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+		offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+	else:
+		offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+		offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 	offs_k = tl.arange(0, BLOCK_K)
 
 	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -531,27 +576,52 @@ def _int8_matmul_dequant_per_row_kernel(
 	accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
 
 	for k in range(0, tl.cdiv(K, BLOCK_K)):
-		a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-		b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+		k_mask = offs_k < K - k * BLOCK_K
+		if LEGACY_UNSAFE:
+			a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+		elif HAS_MN_TAIL:
+			a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
+		else:
+			a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
 		accumulator += tl.dot(a, b)
 		a_ptrs += BLOCK_K * stride_ak
 		b_ptrs += BLOCK_K * stride_bk
 
 	# 3. Fused Epilogue (Dequantize & Bias)
-	scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
-	scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
+	if LEGACY_UNSAFE:
+		scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+		scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
+	elif HAS_MN_TAIL:
+		scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < M, other=0.0)  # Vector [BLOCK_M]
+		scale_b = tl.load(b_scale_ptr + offs_bn, mask=offs_bn < N, other=0.0)  # Vector [BLOCK_N]
+	else:
+		scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+		scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
 
 	c = accumulator.to(tl.float32)
 	total_scale = scale_a[:, None] * scale_b[None, :]
 	c = c * total_scale
 
 	if HAS_BIAS:
-		bias = tl.load(bias_ptr + offs_bn)
+		if LEGACY_UNSAFE:
+			bias = tl.load(bias_ptr + offs_bn)
+		elif HAS_MN_TAIL:
+			bias = tl.load(bias_ptr + offs_bn, mask=offs_bn < N, other=0.0)
+		else:
+			bias = tl.load(bias_ptr + offs_bn)
 		c = c + bias[None, :]
 
 	# 4. Store Result
 	c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-	c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	if LEGACY_UNSAFE:
+		c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	elif HAS_MN_TAIL:
+		c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+	else:
+		c_mask = True
 	tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -560,7 +630,7 @@ def _int8_matmul_dequant_per_row_kernel(
 # =============================================================================
 
 
-def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias=None, compute_dtype=torch.float16):
+def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias=None, compute_dtype=torch.float16, weight_is_prepacked: bool = False, legacy_unsafe: bool = False):
 	"""
 	Fused pipeline for W8A8 Linear Layer with per-row weight quantization.
 	weight_scale: [N, 1] per-row scales
@@ -570,7 +640,7 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
 	x_2d = x.reshape(-1, x_shape_orig[-1])
 
 	M, K = x_2d.shape
-	N = weight.shape[0]
+	N = weight.shape[1] if weight_is_prepacked else weight.shape[0]
 
 	# 2. Dynamic Activation Quantization
 	x_int8, x_scale = triton_quantize_rowwise(x_2d)
@@ -586,13 +656,16 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
 
 	has_bias = bias is not None
 	bias_ptr = bias if has_bias else x  # Dummy pointer if None
-	launch_kwargs = {"HAS_BIAS": has_bias}
+	launch_kwargs = {"HAS_BIAS": has_bias, "HAS_MN_TAIL": True, "LEGACY_UNSAFE": bool(legacy_unsafe)}
 	if not _ENABLE_TRITON_AUTOTUNE:
+		has_mn_tail = (M % _FIXED_KERNEL_CONFIG["BLOCK_M"]) != 0 or (N % _FIXED_KERNEL_CONFIG["BLOCK_N"]) != 0
 		launch_kwargs.update({
 			"BLOCK_M": _FIXED_KERNEL_CONFIG["BLOCK_M"],
 			"BLOCK_N": _FIXED_KERNEL_CONFIG["BLOCK_N"],
 			"BLOCK_K": _FIXED_KERNEL_CONFIG["BLOCK_K"],
 			"GROUP_SIZE_M": _FIXED_KERNEL_CONFIG["GROUP_SIZE_M"],
+			"HAS_MN_TAIL": has_mn_tail,
+			"LEGACY_UNSAFE": bool(legacy_unsafe),
 			"num_warps": _FIXED_KERNEL_CONFIG["num_warps"],
 			"num_stages": _FIXED_KERNEL_CONFIG["num_stages"],
 		})
@@ -609,8 +682,8 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
 		K=K,
 		stride_am=x_int8.stride(0),
 		stride_ak=x_int8.stride(1),
-		stride_bk=weight.stride(1),
-		stride_bn=weight.stride(0),
+		stride_bk=weight.stride(0) if weight_is_prepacked else weight.stride(1),
+		stride_bn=weight.stride(1) if weight_is_prepacked else weight.stride(0),
 		stride_cm=output.stride(0),
 		stride_cn=output.stride(1),
 		**launch_kwargs)

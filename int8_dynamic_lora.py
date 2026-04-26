@@ -4,6 +4,7 @@ import comfy.lora
 import comfy.patcher_extension
 import logging
 import torch
+import uuid
 
 try:
     from comfy.weight_adapter.lora import LoRAAdapter
@@ -199,7 +200,8 @@ class INT8DynamicLoraLoader:
             opts["dynamic_loras"].append({
                 "name": lora_name,
                 "strength": strength,
-                "patches": dynamic_patch_dict
+                "patches": dynamic_patch_dict,
+                "patch_uuid": uuid.uuid4().hex,
             })
 
         if static_patch_dict:
@@ -276,7 +278,8 @@ class INT8DynamicLoraStack:
                 opts["dynamic_loras"].append({
                     "name": lora_name,
                     "strength": strength,
-                    "patches": dynamic_patch_dict
+                    "patches": dynamic_patch_dict,
+                    "patch_uuid": uuid.uuid4().hex,
                 })
 
             if static_patch_dict:

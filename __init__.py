@@ -88,10 +88,12 @@ try:
     from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
     from .int8_kernel_config_node import INT8KernelConfigTuner
     from .int8_model_adapter import INT8ModelAdapter
+    from .int8_lazy_compile import INT8LazyTorchCompile
 
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
         "INT8ModelAdapter": INT8ModelAdapter,
+        "INT8LazyTorchCompile": INT8LazyTorchCompile,
         "INT8LoraLoader": INT8LoraLoader,
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
         "INT8KernelConfigTuner": INT8KernelConfigTuner,
@@ -100,6 +102,7 @@ try:
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
         "INT8ModelAdapter": "Enable INT8 on MODEL",
+        "INT8LazyTorchCompile": "INT8 Lazy Torch Compile",
         "INT8LoraLoader": "Load LoRA INT8",
         "INT8LoraLoaderStack": "Load LoRA Stack INT8",
         "INT8KernelConfigTuner": "INT8 Kernel Config",
