@@ -17,6 +17,7 @@ except Exception:
 
 
 INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
+SUPPORTED_QUANTIZATION_FORMATS = ("int8_tensorwise", "convrot_w4a4")
 
 
 def _get_lora_signature(model_patcher):
@@ -50,6 +51,50 @@ def _is_plain_lora_adapter(adapter):
 
 def _is_weight_adapter(adapter):
 	return _is_plain_lora_adapter(adapter) or (_WEIGHT_ADAPTER_BASE_AVAILABLE and isinstance(adapter, WeightAdapterBase))
+
+
+def _set_lora_source_key(adapter, lora_name):
+	if _is_weight_adapter(adapter):
+		setattr(
+			adapter,
+			"_quantization_toolkit_lora_source_key",
+			_normalize_lora_source_key(lora_name),
+		)
+	return adapter
+
+
+def _normalize_lora_source_key(lora_name):
+	return str(lora_name).replace("\\", "/").casefold()
+
+
+def _is_plain_additive_lora_adapter(adapter):
+	if not _is_plain_lora_adapter(adapter):
+		return False
+	weights = getattr(adapter, "weights", None)
+	if not isinstance(weights, (tuple, list)) or len(weights) < 6:
+		return False
+	return weights[4] is None and weights[5] is None
+
+
+def _is_additive_stochastic_patch(adapter):
+	if _is_plain_additive_lora_adapter(adapter):
+		return True
+	if not isinstance(adapter, (tuple, list)):
+		return False
+	if len(adapter) == 1:
+		return True
+	return len(adapter) == 2 and adapter[0] == "diff"
+
+
+def _canonicalize_stochastic_patches(patches):
+	if not patches or not all(_is_plain_additive_lora_adapter(adapter) for adapter, _strength in patches):
+		return patches
+	if not all(hasattr(adapter, "_quantization_toolkit_lora_source_key") for adapter, _strength in patches):
+		return patches
+	return sorted(
+		patches,
+		key=lambda patch: getattr(patch[0], "_quantization_toolkit_lora_source_key"),
+	)
 
 
 def _extract_layer_name(key):
@@ -132,6 +177,20 @@ def _get_weight_scale_for_module(target_module):
 	return weight_scale
 
 
+def _get_supported_quantization_format(module):
+	if getattr(module, "_is_quantized", False):
+		return getattr(module, "_quant_format", "int8_tensorwise")
+	for attribute_name in ("_quant_format", "quant_format"):
+		quantization_format = getattr(module, attribute_name, None)
+		if quantization_format in SUPPORTED_QUANTIZATION_FORMATS:
+			return quantization_format
+	return None
+
+
+def _uses_toolkit_quantized_runtime(module):
+	return bool(getattr(module, "_is_quantized", False))
+
+
 def _mark_deferred_int8_patch(adapter):
 	setattr(adapter, "_int8_defer_until_quantized", True)
 	return adapter
@@ -175,7 +234,7 @@ def _create_stochastic_stack_adapter(patches, weight_scale, seed, outlier_method
 	from .int8_quant import INT8MergedLoRAPatchAdapter
 
 	merged_adapter = INT8MergedLoRAPatchAdapter(
-		patches,
+		_canonicalize_stochastic_patches(patches),
 		weight_scale,
 		seed=seed,
 		outlier_method=outlier_method,
@@ -188,14 +247,14 @@ def _create_stochastic_stack_adapter(patches, weight_scale, seed, outlier_method
 	return merged_adapter
 
 
-def _model_has_quantized_int8_modules(model_patcher):
+def _model_has_supported_quantized_modules(model_patcher):
 	for object_patch_map_name in ("object_patches", "object_patches_backup"):
 		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
 		if not isinstance(object_patch_map, dict):
 			continue
 
 		for _patch_key, module in object_patch_map.items():
-			if getattr(module, "_is_quantized", False):
+			if _get_supported_quantization_format(module) is not None:
 				return True
 
 	diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
@@ -203,9 +262,26 @@ def _model_has_quantized_int8_modules(model_patcher):
 		return False
 
 	for _module_name, module in diffusion_model.named_modules():
-		if getattr(module, "_is_quantized", False):
+		if _get_supported_quantization_format(module) is not None:
 			return True
 	return False
+
+
+def _model_has_int4_modules(model_patcher):
+	for object_patch_map_name in ("object_patches", "object_patches_backup"):
+		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
+		if isinstance(object_patch_map, dict):
+			for module in object_patch_map.values():
+				if _get_supported_quantization_format(module) == "convrot_w4a4":
+					return True
+
+	diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
+	if diffusion_model is None:
+		return False
+	return any(
+		_get_supported_quantization_format(module) == "convrot_w4a4"
+		for module in diffusion_model.modules()
+	)
 
 
 def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, defer_unquantized=True):
@@ -215,10 +291,17 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, 
 	for key, adapter in patch_dict.items():
 		try:
 			target_module = _resolve_target_module_cached(model_patcher, key, module_cache)
-			is_quantized = hasattr(target_module, "_is_quantized") and target_module._is_quantized
+			quantization_format = _get_supported_quantization_format(target_module)
 
 			if _is_weight_adapter(adapter):
-				if is_quantized:
+				if quantization_format is not None:
+					applied_count += 1
+					if (
+						not _uses_toolkit_quantized_runtime(target_module)
+						or quantization_format == "convrot_w4a4"
+					):
+						final_patch_dict[key] = adapter
+						continue
 					weight_scale = _get_weight_scale_for_module(target_module)
 					outlier_method = getattr(target_module, "_outlier_method", None)
 					hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
@@ -239,7 +322,6 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, 
 					)
 				else:
 					final_patch_dict[key] = adapter
-				applied_count += 1
 			else:
 				final_patch_dict[key] = adapter
 		except Exception:
@@ -260,7 +342,14 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
 
 		try:
 			target_module = _resolve_target_module_cached(model_patcher, key, module_cache)
-			if not (hasattr(target_module, "_is_quantized") and target_module._is_quantized):
+			quantization_format = _get_supported_quantization_format(target_module)
+			if quantization_format is None:
+				wrapped_patch_dict[key] = adapter
+				continue
+			if (
+				not _uses_toolkit_quantized_runtime(target_module)
+				or quantization_format == "convrot_w4a4"
+			):
 				wrapped_patch_dict[key] = adapter
 				continue
 

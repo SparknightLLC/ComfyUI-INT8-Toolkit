@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from contextlib import contextmanager
+import weakref
 
 import comfy.lora
 import comfy.model_management
@@ -12,9 +12,17 @@ from torch import nn
 
 from .int8_quant import (
 	Int8TensorwiseOps,
+	OUTLIER_METHOD_CONVROT,
 	OUTLIER_METHOD_HADANORM,
 	OUTLIER_METHOD_NONE,
 	OUTLIER_METHOD_QUAROT,
+	QUANTIZATION_MODE_CHOICES,
+	QUANTIZATION_MODE_INT4_MIXED,
+	normalize_quantization_mode,
+	quantization_mode_is_int4,
+	quantization_mode_outlier_method,
+	quantize_native_int4,
+	native_int4_available,
 	INT8_BACKEND_CHOICES,
 	DEFAULT_INT8_BACKEND,
 	INT8_BACKEND_TRITON,
@@ -39,9 +47,12 @@ from .int8_unet_loader import MODEL_TYPE_FLUX2_FAST_UNSAFE
 from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
 from .int8_unet_loader import MODEL_TYPE_IDEOGRAM4
 from .int8_unet_loader import MODEL_TYPE_KREA2
-from .int8_unet_loader import OUTLIER_METHOD_CHOICES
-from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
-from .int8_unet_loader import get_model_type_exclusions
+from .int8_unet_loader import DEFAULT_QUANTIZATION_MODE
+from .int8_unet_loader import get_model_type_quantization_preset
+from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
+from .quantization_policy import is_int4_compatible_linear
+from .quantization_policy import normalize_int4_mixed_ratio
+from .quantization_policy import select_int4_mixed_layers
 
 try:
 	import comfy_api.torch_helpers.torch_compile as comfy_torch_compile
@@ -63,11 +74,20 @@ except Exception:
 AUTO_MODEL_TYPE = "auto"
 NONE_MODEL_TYPE = "none"
 MODEL_TYPE_CHOICES = [AUTO_MODEL_TYPE] + LOADER_MODEL_TYPE_CHOICES + [NONE_MODEL_TYPE]
+QUANTIZATION_CONTROL_AS_NEEDED = "as_needed"
+QUANTIZATION_CONTROL_ALWAYS = "always"
+QUANTIZATION_CONTROL_BYPASS = "bypass"
+QUANTIZATION_CONTROL_CHOICES = [
+	QUANTIZATION_CONTROL_AS_NEEDED,
+	QUANTIZATION_CONTROL_ALWAYS,
+	QUANTIZATION_CONTROL_BYPASS,
+]
 _INT8_MODEL_ADAPTER_WRAPPER_KEY = "int8_model_adapter_cache_notice"
 _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY = "int8_model_adapter_original_modules"
 _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY = "int8_model_adapter_output_cache"
 _INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
-_INT8_MODEL_ADAPTER_OUTPUT_CACHE = {}
+_INT8_MODEL_ADAPTER_LAST_MODEL_REF = None
+_INT8_MODEL_ADAPTER_LAST_MODEL_ID = None
 try:
 	_INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT = max(0, int(os.environ.get("INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT", "1")))
 except ValueError:
@@ -183,8 +203,8 @@ def _patch_base_key(patch_key):
 	return patch_key[0] if isinstance(patch_key, tuple) else patch_key
 
 
-def _is_excluded(module_name, excluded_names):
-	return any(excluded_name in module_name for excluded_name in excluded_names)
+def _matches_layer_patterns(module_name, layer_patterns):
+	return any(layer_pattern in module_name for layer_pattern in layer_patterns)
 
 
 def _is_comfy_quantized_tensor(value):
@@ -284,36 +304,42 @@ def _infer_model_type_from_modules(diffusion_model):
 	return best_model_type
 
 
-def _get_conservative_auto_exclusions():
-	excluded_names = []
-	seen_names = set()
+def _empty_quantization_preset():
+	return {"keep_float": (), "int4_sensitive": ()}
+
+
+def _get_conservative_auto_preset():
+	merged_preset = {"keep_float": [], "int4_sensitive": []}
+	seen_names = {key: set() for key in merged_preset}
 	for candidate_model_type in LOADER_MODEL_TYPE_CHOICES:
-		for excluded_name in get_model_type_exclusions(candidate_model_type):
-			if excluded_name in seen_names:
-				continue
-			seen_names.add(excluded_name)
-			excluded_names.append(excluded_name)
-	return excluded_names
+		candidate_preset = get_model_type_quantization_preset(candidate_model_type)
+		for preset_key in merged_preset:
+			for layer_name in candidate_preset[preset_key]:
+				if layer_name in seen_names[preset_key]:
+					continue
+				seen_names[preset_key].add(layer_name)
+				merged_preset[preset_key].append(layer_name)
+	return {key: tuple(names) for key, names in merged_preset.items()}
 
 
-def _resolve_model_type_and_exclusions(model_type, diffusion_model, log_progress):
+def _resolve_model_type_and_preset(model_type, diffusion_model, log_progress):
 	if model_type == AUTO_MODEL_TYPE:
 		detected_model_type = _infer_model_type_from_modules(diffusion_model)
 		if detected_model_type is None:
 			logging.warning(
-				"INT8 Model Adapter: auto model_type could not identify this model; "
-				"using conservative union exclusions. Select a model_type manually for better speed."
+				"Quantization Model Adapter: auto model_type could not identify this model; "
+				"using the conservative union quantization preset. Select a model_type manually for better speed."
 			)
-			return "auto-conservative", _get_conservative_auto_exclusions()
+			return "auto-conservative", _get_conservative_auto_preset()
 
 		if log_progress:
-			print(f"[INT8 Model Adapter] auto model_type resolved to {detected_model_type}")
-		return detected_model_type, get_model_type_exclusions(detected_model_type)
+			logging.info(f"Quantization Model Adapter: auto model_type resolved to {detected_model_type}.")
+		return detected_model_type, get_model_type_quantization_preset(detected_model_type)
 
 	if model_type == NONE_MODEL_TYPE:
-		return NONE_MODEL_TYPE, []
+		return NONE_MODEL_TYPE, _empty_quantization_preset()
 
-	return model_type, get_model_type_exclusions(model_type)
+	return model_type, get_model_type_quantization_preset(model_type)
 
 
 def _is_supported_linear(module):
@@ -344,6 +370,30 @@ def _is_supported_linear_fast_unsafe(module):
 	return weight.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight.dtype)
 
 
+def _module_has_target_quantization(module):
+	if getattr(module, "_is_quantized", False):
+		return True
+	return (
+		getattr(module, "_quant_format", None) in ("int8_tensorwise", "convrot_w4a4")
+		or getattr(module, "quant_format", None) in ("int8_tensorwise", "convrot_w4a4")
+	)
+
+
+def _model_has_quantized_modules(model_patcher):
+	for object_patch_map_name in ("object_patches", "object_patches_backup"):
+		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
+		if isinstance(object_patch_map, dict) and any(
+			_module_has_target_quantization(module)
+			for module in object_patch_map.values()
+		):
+			return True
+
+	diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
+	if diffusion_model is None:
+		return False
+	return any(_module_has_target_quantization(module) for module in diffusion_model.modules())
+
+
 def _collect_layer_patch_keys(model_patcher, module_name):
 	weight_key = _module_weight_key(module_name)
 	return [
@@ -359,7 +409,7 @@ def _is_deferred_int8_stochastic_patch(patch_entry):
 	return bool(getattr(patch_entry[1], "_int8_defer_until_quantized", False))
 
 
-def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys):
+def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys, bake_deferred=False):
 	bake_patches = []
 	consumed_patch_keys = []
 	deferred_patch_keys = []
@@ -371,7 +421,7 @@ def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys):
 		deferred_entries = []
 
 		for patch_entry in patch_entries:
-			if _is_deferred_int8_stochastic_patch(patch_entry):
+			if _is_deferred_int8_stochastic_patch(patch_entry) and not bake_deferred:
 				deferred_entries.append(patch_entry)
 			else:
 				bake_entries.append(patch_entry)
@@ -390,6 +440,8 @@ def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys):
 
 
 def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_module):
+	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
+		return
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
 
 	weight_scale = getattr(q_module, "weight_scale", None)
@@ -430,7 +482,7 @@ def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_modul
 			elif isinstance(patch_obj, INT8LoRAPatchAdapter):
 				configured_patch_obj = INT8LoRAPatchAdapter(
 					patch_obj.loaded_keys,
-					patch_obj.weights,
+					patch_obj.lora_weights,
 					weight_scale,
 					seed=patch_obj.seed,
 					outlier_method=outlier_method,
@@ -445,7 +497,7 @@ def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_modul
 		model_patcher.patches[patch_key] = updated_entries
 
 
-def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
+def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras, bake_deferred=False):
 	weight = _materialize_source_weight(module.weight)
 	weight_key = _module_weight_key(module_name)
 	layer_patch_keys = _collect_layer_patch_keys(model_patcher, module_name)
@@ -456,6 +508,7 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 	bake_patches, consumed_patch_keys, deferred_patch_keys, remaining_patch_entries = _build_layer_patch_bake_plan(
 		model_patcher,
 		layer_patch_keys,
+		bake_deferred=bake_deferred,
 	)
 
 	if not bake_patches:
@@ -479,16 +532,62 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 	return patched_weight.detach(), consumed_patch_keys, deferred_patch_keys, remaining_patch_entries
 
 
-def _quantize_linear_module(module_name, module, source_weight, outlier_method):
+def _quantize_linear_module(module_name, module, source_weight, quantization_mode, int4_sensitive=False):
 	compute_device = _get_int8_compute_device(source_weight.device)
 	weight_work = tensor_to_int8_compute_device(source_weight, compute_device, non_blocking=True)
-	outlier_method = (outlier_method or OUTLIER_METHOD_NONE).strip().lower()
-	use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
-	group_size = _get_outlier_group_size(outlier_method)
+	quantization_mode = normalize_quantization_mode(quantization_mode)
+	int4_mode = quantization_mode_is_int4(quantization_mode)
+	outlier_method = quantization_mode_outlier_method(quantization_mode)
 
 	if _is_float8_dtype(weight_work.dtype):
 		weight_work = weight_work.to(torch.float16 if compute_device.type == "cuda" else torch.float32)
-	elif outlier_method != OUTLIER_METHOD_NONE and weight_work.dtype in (torch.float16, torch.bfloat16):
+
+	use_int4 = (
+		int4_mode
+		and not (quantization_mode == QUANTIZATION_MODE_INT4_MIXED and int4_sensitive)
+		and weight_work.ndim == 2
+		and weight_work.shape[1] % 256 == 0
+	)
+	if use_int4:
+		q_weight = quantize_native_int4(weight_work, linear_dtype="int4").to("cpu")
+		q_module = Int8TensorwiseOps.Linear(
+			module.in_features,
+			module.out_features,
+			bias=module.bias is not None,
+			device=torch.device("meta"),
+		)
+		q_module.weight = nn.Parameter(q_weight, requires_grad=False)
+		q_module.weight_scale = q_weight._params.scale
+		q_module.weight_packed = None
+		q_module.weight_int_mm = None
+		q_module._is_quantized = True
+		q_module._quant_format = "convrot_w4a4"
+		q_module._is_per_row = True
+		q_module._use_quarot = False
+		q_module._outlier_method = OUTLIER_METHOD_NONE
+		q_module._convrot_groupsize = q_weight._params.convrot_groupsize
+		q_module._quant_group_size = q_weight._params.quant_group_size
+		q_module._linear_dtype = q_weight._params.linear_dtype
+		q_module.quarot_hadamard = None
+		q_module.hadanorm_sigma = None
+		q_module.compute_dtype = getattr(module, "compute_dtype", torch.bfloat16)
+		q_module.dynamic_lora_entries = None
+		q_module.lora_A = None
+		q_module.lora_B = None
+		q_module.lora_alpha = None
+		if module.bias is not None:
+			q_module.bias = nn.Parameter(module.bias.detach().cpu(), requires_grad=False)
+		else:
+			q_module.bias = None
+		q_module.train(module.training)
+		return q_module, True
+
+	if int4_mode:
+		outlier_method = OUTLIER_METHOD_CONVROT if weight_work.shape[1] % 256 == 0 else OUTLIER_METHOD_NONE
+	use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
+	group_size = _get_outlier_group_size(outlier_method)
+
+	if outlier_method != OUTLIER_METHOD_NONE and weight_work.dtype in (torch.float16, torch.bfloat16):
 		weight_work = weight_work.float()
 
 	quarot_hadamard = None
@@ -508,7 +607,7 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 			weight_work = _rotate_weight_for_outlier_method(weight_work, h_matrix, group_size=group_size, method=outlier_method)
 			quarot_hadamard = h_matrix.detach().cpu()
 		except Exception as e:
-			logging.warning(f"INT8 Model Adapter: {outlier_method} skipped for {module_name} ({e}).")
+			logging.warning(f"Quantization Model Adapter: {outlier_method} skipped for {module_name} ({e}).")
 			use_quarot = False
 			outlier_method = OUTLIER_METHOD_NONE
 
@@ -531,6 +630,7 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 		else torch.tensor([float(q_scale)], dtype=torch.float32)
 	)
 	q_module._is_quantized = True
+	q_module._quant_format = "int8_tensorwise"
 	q_module._is_per_row = q_module.weight_scale.dim() == 2 and q_module.weight_scale.shape[1] == 1
 	q_module._use_quarot = use_quarot
 	q_module.quarot_hadamard = quarot_hadamard
@@ -592,36 +692,19 @@ def _is_first_sampling_step(transformer_options):
 	return abs(current_sigma - start_sigma) <= max(1e-6, abs(start_sigma) * 1e-6)
 
 
-@contextmanager
-def _temporary_anima_text_id_dtype_guard(diffusion_model, adapter_state):
+def _validate_anima_text_id_dtype(kwargs, adapter_state):
 	if not isinstance(adapter_state, dict) or adapter_state.get("model_type") != "anima":
-		yield
-		return
-	if diffusion_model is None:
-		yield
 		return
 
-	preprocess_text_embeds = getattr(diffusion_model, "preprocess_text_embeds", None)
-	if not callable(preprocess_text_embeds):
-		yield
-		return
-
-	def guarded_preprocess_text_embeds(text_embeds, text_ids, *args, **kwargs):
-		if isinstance(text_ids, torch.Tensor) and text_ids.dtype not in (torch.int, torch.long):
-			raise RuntimeError(
-				"INT8 Model Adapter: Anima text ids arrived with dtype "
-				f"{text_ids.dtype}, but Anima requires integer token ids for its embedding layer. "
-				"This is usually caused by a conditioning node applying math to the entire conditioning "
-				"payload, including t5xxl_ids. RES4LYF ConditioningMultiply is known to do this. Remove "
-				"that node for Anima or use conditioning math that leaves token-id tensors unchanged."
-			)
-		return preprocess_text_embeds(text_embeds, text_ids, *args, **kwargs)
-
-	diffusion_model.preprocess_text_embeds = guarded_preprocess_text_embeds
-	try:
-		yield
-	finally:
-		diffusion_model.preprocess_text_embeds = preprocess_text_embeds
+	text_ids = kwargs.get("t5xxl_ids", None)
+	if isinstance(text_ids, torch.Tensor) and text_ids.dtype not in (torch.int, torch.long):
+		raise RuntimeError(
+			"Quantization Model Adapter: Anima text ids arrived with dtype "
+			f"{text_ids.dtype}, but Anima requires integer token ids for its embedding layer. "
+			"This is usually caused by a conditioning node applying math to the entire conditioning "
+			"payload, including t5xxl_ids. RES4LYF ConditioningMultiply is known to do this. Remove "
+			"that node for Anima or use conditioning math that leaves token-id tensors unchanged."
+		)
 
 
 def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
@@ -646,8 +729,8 @@ def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 			diffusion_model._int8_model_adapter_notice_in_generation = True
 		elif _is_first_sampling_step(transformer_options):
 			if not getattr(diffusion_model, "_int8_model_adapter_notice_in_generation", False):
-				print(
-					"\n[INT8 Model Adapter] Reusing cached INT8 MODEL output "
+				logging.info(
+					"Quantization Model Adapter: reusing cached INT8 MODEL output "
 					f"(quantized_layers={adapter_state.get('quantized_layers', '?')}, "
 					f"model_type={adapter_state.get('model_type', '?')}, "
 					f"backend={adapter_state.get('runtime_backend', '?')}, "
@@ -659,10 +742,10 @@ def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 		else:
 			diffusion_model._int8_model_adapter_notice_in_generation = False
 
-	with _temporary_anima_text_id_dtype_guard(diffusion_model, adapter_state):
-		result = executor(*args, **kwargs)
+	_validate_anima_text_id_dtype(kwargs, adapter_state)
+	result = executor(*args, **kwargs)
 	if isinstance(adapter_state, dict):
-		Int8TensorwiseOps.print_runtime_stats()
+		Int8TensorwiseOps.log_runtime_stats()
 	return result
 
 
@@ -709,7 +792,8 @@ def _build_adapter_cache_key(
 	model_patcher,
 	resolved_model_type,
 	model_type,
-	outlier_method,
+	quantization_mode,
+	int4_mixed_ratio,
 	small_batch_fallback,
 	runtime_backend,
 	prepack_int8_weights,
@@ -721,12 +805,13 @@ def _build_adapter_cache_key(
 		lora_signature = ("no_lora_patches",)
 
 	return (
-		"v4",
+		"v5",
 		id(getattr(model_patcher, "model", None)),
 		tuple(lora_signature),
 		str(resolved_model_type),
 		str(model_type),
-		str(outlier_method),
+		str(quantization_mode),
+		float(int4_mixed_ratio),
 		str(small_batch_fallback),
 		str(runtime_backend),
 		bool(prepack_int8_weights),
@@ -738,9 +823,55 @@ def _build_adapter_cache_key(
 def _get_output_cache(shared_model):
 	cache = getattr(shared_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, None)
 	if not isinstance(cache, dict):
-		cache = _INT8_MODEL_ADAPTER_OUTPUT_CACHE
+		cache = {}
 		setattr(shared_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, cache)
 	return cache
+
+
+def _make_model_ref(shared_model):
+	try:
+		return weakref.ref(shared_model)
+	except TypeError:
+		return lambda: None
+
+
+def _cleanup_adapter_cache_memory():
+	try:
+		import gc
+		gc.collect()
+	except Exception:
+		pass
+	_cleanup_torch_memory()
+
+
+def _dispose_cached_adapter_output(model_patcher):
+	unpatch_model = getattr(model_patcher, "unpatch_model", None)
+	if not callable(unpatch_model):
+		return
+	try:
+		unpatch_model(unpatch_weights=True)
+	except Exception as e:
+		logging.warning(f"Quantization Model Adapter: failed to unpatch an evicted cached output ({e}).")
+
+
+def _prepare_model_cache(shared_model):
+	global _INT8_MODEL_ADAPTER_LAST_MODEL_ID, _INT8_MODEL_ADAPTER_LAST_MODEL_REF
+
+	shared_model_id = id(shared_model)
+	prior_model = _INT8_MODEL_ADAPTER_LAST_MODEL_REF() if callable(_INT8_MODEL_ADAPTER_LAST_MODEL_REF) else None
+	model_changed = _INT8_MODEL_ADAPTER_LAST_MODEL_ID is not None and _INT8_MODEL_ADAPTER_LAST_MODEL_ID != shared_model_id
+	if model_changed:
+		if prior_model is not None:
+			prior_cache = getattr(prior_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, None)
+			if isinstance(prior_cache, dict):
+				for cached_model_patcher in prior_cache.values():
+					_dispose_cached_adapter_output(cached_model_patcher)
+				prior_cache.clear()
+		_cleanup_adapter_cache_memory()
+
+	_INT8_MODEL_ADAPTER_LAST_MODEL_REF = _make_model_ref(shared_model)
+	_INT8_MODEL_ADAPTER_LAST_MODEL_ID = shared_model_id
+	return _get_output_cache(shared_model)
 
 
 def _normalize_runtime_backend(runtime_backend):
@@ -793,27 +924,39 @@ def _remember_cached_output(shared_model, cache_key, model_patcher):
 		old_key = next(iter(cache))
 		if old_key == cache_key and len(cache) > 1:
 			old_key = next(key for key in cache if key != cache_key)
-		cache.pop(old_key)
-	_cleanup_torch_memory()
+		_dispose_cached_adapter_output(cache.pop(old_key))
+	_cleanup_adapter_cache_memory()
 
 
-def _collect_int8_candidates(diffusion_model, excluded_names, fast_unsafe=False):
+def _make_output_cache_room(cache):
+	if _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT <= 0:
+		return
+
+	evicted = False
+	while len(cache) >= _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT:
+		_dispose_cached_adapter_output(cache.pop(next(iter(cache))))
+		evicted = True
+	if evicted:
+		_cleanup_adapter_cache_memory()
+
+
+def _collect_int8_candidates(diffusion_model, keep_float_names, fast_unsafe=False):
 	is_supported = _is_supported_linear_fast_unsafe if fast_unsafe else _is_supported_linear
 	return [
 		(module_name, module)
 		for module_name, module in diffusion_model.named_modules()
 		if module_name
-		and not _is_excluded(module_name, excluded_names)
+		and not _matches_layer_patterns(module_name, keep_float_names)
 		and is_supported(module)
 	]
 
 
-def _collect_existing_int8_modules(diffusion_model, excluded_names):
+def _collect_existing_int8_modules(diffusion_model, keep_float_names):
 	return [
 		(module_name, module)
 		for module_name, module in diffusion_model.named_modules()
 		if module_name
-		and not _is_excluded(module_name, excluded_names)
+		and not _matches_layer_patterns(module_name, keep_float_names)
 		and isinstance(module, Int8TensorwiseOps.Linear)
 		and getattr(module, "_is_quantized", False)
 	]
@@ -828,6 +971,8 @@ def _get_int8_patch_weight_scale(q_module):
 
 def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 	if not _WEIGHT_ADAPTER_AVAILABLE or not isinstance(patch_obj, WeightAdapterBase):
+		return patch_obj, False
+	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
 		return patch_obj, False
 
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
@@ -864,7 +1009,7 @@ def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 		return (
 			INT8LoRAPatchAdapter(
 				patch_obj.loaded_keys,
-				patch_obj.weights,
+				patch_obj.lora_weights,
 				weight_scale,
 				seed=patch_obj.seed,
 				outlier_method=outlier_method,
@@ -899,6 +1044,9 @@ def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 
 
 def _set_existing_int8_weight(q_module, new_weight):
+	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
+		q_module.set_weight(new_weight, seed=comfy.utils.string_to_seed("int4_existing_patch"))
+		return
 	if hasattr(q_module, "_replace_weight"):
 		q_module._replace_weight(new_weight)
 	else:
@@ -919,6 +1067,7 @@ def _clone_existing_int8_module(q_module):
 		device=torch.device("meta"),
 	)
 	cloned_module.weight = nn.Parameter(q_module.weight.detach().clone(), requires_grad=False)
+	cloned_module._quant_format = getattr(q_module, "_quant_format", "int8_tensorwise")
 	cloned_module.weight_scale = (
 		q_module.weight_scale.detach().clone()
 		if isinstance(q_module.weight_scale, torch.Tensor)
@@ -926,10 +1075,18 @@ def _clone_existing_int8_module(q_module):
 	)
 	cloned_module.weight_packed = (
 		cloned_module.weight.detach().T.contiguous()
-		if getattr(q_module, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights)
+		if cloned_module._quant_format == "int8_tensorwise"
+		and getattr(q_module, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights)
 		else None
 	)
-	cloned_module.weight_int_mm = _prepack_torch_int_mm_weight(cloned_module.weight)
+	cloned_module.weight_int_mm = (
+		_prepack_torch_int_mm_weight(cloned_module.weight)
+		if cloned_module._quant_format == "int8_tensorwise"
+		else None
+	)
+	cloned_module._convrot_groupsize = getattr(q_module, "_convrot_groupsize", 256)
+	cloned_module._quant_group_size = getattr(q_module, "_quant_group_size", 64)
+	cloned_module._linear_dtype = getattr(q_module, "_linear_dtype", "int4")
 	cloned_module.quarot_hadamard = (
 		q_module.quarot_hadamard.detach().clone()
 		if isinstance(q_module.quarot_hadamard, torch.Tensor)
@@ -1019,9 +1176,14 @@ def _configure_existing_int8_patches(model_patcher, existing_modules, bake_loade
 					intermediate_dtype = torch.float16
 
 				try:
+					work_weight = (
+						target_module.convert_weight(weight.detach().clone())
+						if getattr(target_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4"
+						else weight.detach().clone()
+					)
 					baked_weight = comfy.lora.calculate_weight(
 						updated_entries,
-						weight.detach().clone(),
+						work_weight,
 						_module_weight_key(module_name),
 						intermediate_dtype=intermediate_dtype,
 					)
@@ -1029,7 +1191,7 @@ def _configure_existing_int8_patches(model_patcher, existing_modules, bake_loade
 					model_patcher.patches.pop(patch_key, None)
 					baked_count += len(updated_entries)
 				except Exception as e:
-					logging.warning(f"INT8 Model Adapter: failed to bake existing INT8 patches for {module_name} ({e}).")
+					logging.warning(f"Quantization Model Adapter: failed to bake existing INT8 patches for {module_name} ({e}).")
 					model_patcher.patches[patch_key] = updated_entries
 			else:
 				model_patcher.patches[patch_key] = updated_entries
@@ -1095,9 +1257,9 @@ def _reset_prior_int8_object_patches(model_patcher):
 
 	if int8_patch_keys:
 		try:
-			model_patcher.unpatch_model(unpatch_weights=False)
+			model_patcher.unpatch_model(unpatch_weights=True)
 		except Exception as e:
-			logging.warning(f"INT8 Model Adapter: failed to fully reset prior INT8 object patches ({e}).")
+			logging.warning(f"Quantization Model Adapter: failed to fully reset prior INT8 object patches ({e}).")
 
 	for patch_key, original_module in list(original_module_cache.items()):
 		try:
@@ -1105,11 +1267,9 @@ def _reset_prior_int8_object_patches(model_patcher):
 		except Exception:
 			continue
 
-		if not isinstance(current_module, Int8TensorwiseOps.Linear):
-			continue
-
-		comfy.utils.set_attr(model_patcher.model, patch_key, original_module)
-		int8_patch_keys.add(patch_key)
+		if current_module is not original_module:
+			comfy.utils.set_attr(model_patcher.model, patch_key, original_module)
+			int8_patch_keys.add(patch_key)
 
 	for patch_key in list(model_patcher.object_patches.keys()):
 		if patch_key in int8_patch_keys:
@@ -1127,65 +1287,89 @@ class INT8ModelAdapter:
 	def INPUT_TYPES(s):
 		return {
 			"required": {
-				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to this extension's INT8 linear runtime."}),
-				"enable_int8": ("BOOLEAN", {"default": True, "tooltip": "Disable this to pass the input model through unchanged without removing the node from a workflow."}),
-				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
-				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. ConvRot uses regular Hadamard rotation and can export native Comfy metadata. QuaRot uses this toolkit's legacy Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
+				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to the selected quantization mode."}),
+				"enable_quantization": (QUANTIZATION_CONTROL_CHOICES, {"default": QUANTIZATION_CONTROL_AS_NEEDED, "tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8 or W4A4 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged."}),
+				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
+				"quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. Both INT4 modes preserve keep-float layers. int4_mixed keeps a configurable fraction of compatible linears in ConvRot INT8; int4_full uses W4A4 whenever shapes permit."}),
+				"int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
 				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
-				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
-				"prepack_int8_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental: keep an extra transposed INT8 weight buffer for Triton so output columns are read contiguously. May improve speed but adds roughly one extra INT8 copy of each quantized weight."}),
+				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
+				"prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
 				"bake_loaded_loras": ("BOOLEAN", {"default": True, "tooltip": "Apply existing stock LoRA weight patches, including sliced patches, before quantization, then remove the consumed patches to avoid applying them twice. If disabled, layers with pending patches are left unquantized."}),
-				"log_progress": ("BOOLEAN", {"default": True, "tooltip": "Print quantization progress and layer counts to the ComfyUI console."}),
+				"log_progress": ("BOOLEAN", {"default": True, "tooltip": "Log quantization progress and layer counts to the ComfyUI console."}),
 			}
 		}
 
 	RETURN_TYPES = ("MODEL",)
-	FUNCTION = "apply_int8"
+	FUNCTION = "apply_quantization"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to INT8 W8A8. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
+	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to INT8 or native ConvRot INT4. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
 
-	def apply_int8(
+	def apply_quantization(
 		self,
 		model,
-		enable_int8,
+		enable_quantization,
 		model_type,
-		outlier_method,
+		quantization_mode,
+		int4_mixed_ratio=DEFAULT_INT4_MIXED_RATIO,
 		small_batch_fallback=DEFAULT_SMALL_BATCH_FALLBACK,
 		runtime_backend=DEFAULT_INT8_BACKEND,
-		prepack_int8_weights=False,
+		prepack_weights=False,
 		bake_loaded_loras=True,
 		log_progress=True,
 		use_triton=None,
 		):
-		if not enable_int8:
+		if enable_quantization not in QUANTIZATION_CONTROL_CHOICES:
+			raise ValueError(f"Invalid enable_quantization value {enable_quantization}")
+		if enable_quantization == QUANTIZATION_CONTROL_BYPASS:
+			return (model,)
+		if (
+			enable_quantization == QUANTIZATION_CONTROL_AS_NEEDED
+			and _model_has_quantized_modules(model)
+		):
+			if log_progress:
+				logging.info("Quantization Model Adapter: input MODEL is already quantized; returning it unchanged.")
 			return (model,)
 
+		quantization_mode = normalize_quantization_mode(quantization_mode)
+		int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)
+		effective_int4_mixed_ratio = (
+			int4_mixed_ratio
+			if quantization_mode == QUANTIZATION_MODE_INT4_MIXED
+			else 0.0
+		)
+		if quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+			raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
+
 		source_model_patcher = model
+		output_cache = _prepare_model_cache(source_model_patcher.model)
 		source_diffusion_model = getattr(source_model_patcher.model, "diffusion_model", None)
 		if source_diffusion_model is None:
-			logging.warning("INT8 Model Adapter: model has no diffusion_model; returning unchanged model.")
+			logging.warning("Quantization Model Adapter: model has no diffusion_model; returning unchanged model.")
 			return (source_model_patcher,)
 
-		resolved_model_type, excluded_names = _resolve_model_type_and_exclusions(
+		resolved_model_type, quantization_preset = _resolve_model_type_and_preset(
 			model_type,
 			source_diffusion_model,
 			bool(log_progress),
 		)
+		keep_float_names = quantization_preset["keep_float"]
+		int4_sensitive_names = quantization_preset["int4_sensitive"]
 		fast_unsafe_targeting = resolved_model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE
 		small_batch_fallback = _normalize_small_batch_fallback(small_batch_fallback)
 		runtime_backend = _normalize_runtime_backend(runtime_backend)
 
-		source_existing_int8_modules = _collect_existing_int8_modules(source_diffusion_model, excluded_names)
+		source_existing_int8_modules = _collect_existing_int8_modules(source_diffusion_model, keep_float_names)
 		prior_small_batch_fallback, prior_runtime_backend, prior_prepack_int8_weights = _get_current_int8_runtime_settings(source_existing_int8_modules)
 		source_has_quantizable_candidates = bool(_collect_int8_candidates(
 			source_diffusion_model,
-			excluded_names,
+			keep_float_names,
 			fast_unsafe=fast_unsafe_targeting,
 		))
 		preserve_existing_runtime = bool(source_existing_int8_modules) and not source_has_quantizable_candidates
 		effective_small_batch_fallback = prior_small_batch_fallback if preserve_existing_runtime else small_batch_fallback
 		effective_runtime_backend = prior_runtime_backend if preserve_existing_runtime else runtime_backend
-		effective_prepack_int8_weights = prior_prepack_int8_weights if preserve_existing_runtime else bool(prepack_int8_weights)
+		effective_prepack_int8_weights = prior_prepack_int8_weights if preserve_existing_runtime else bool(prepack_weights)
 
 		lora_signature = _get_lora_signature(source_model_patcher)
 		use_output_cache = _can_cache_adapter_output(source_model_patcher, lora_signature)
@@ -1193,7 +1377,8 @@ class INT8ModelAdapter:
 			source_model_patcher,
 			resolved_model_type,
 			model_type,
-			outlier_method,
+			quantization_mode,
+			effective_int4_mixed_ratio,
 			effective_small_batch_fallback,
 			effective_runtime_backend,
 			effective_prepack_int8_weights,
@@ -1202,18 +1387,19 @@ class INT8ModelAdapter:
 			lora_signature,
 		)
 		if use_output_cache:
-			cached_model_patcher = _get_output_cache(source_model_patcher.model).get(adapter_cache_key)
+			cached_model_patcher = output_cache.get(adapter_cache_key)
 			if cached_model_patcher is not None:
 				if log_progress:
-					print("[INT8 Model Adapter] Reusing cached baked INT8 MODEL output.")
+					logging.info("Quantization Model Adapter: reusing cached MODEL output.")
 				return (cached_model_patcher,)
+			_make_output_cache_room(output_cache)
 
 		model_patcher = source_model_patcher.clone()
 		restored_prior_patch_count = _reset_prior_int8_object_patches(model_patcher)
 		_clear_prior_int8_object_patches(model_patcher)
 		diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
 		if diffusion_model is None:
-			logging.warning("INT8 Model Adapter: model has no diffusion_model; returning unchanged model.")
+			logging.warning("Quantization Model Adapter: model has no diffusion_model; returning unchanged model.")
 			return (model_patcher,)
 
 		_apply_int8_runtime_settings(
@@ -1223,17 +1409,17 @@ class INT8ModelAdapter:
 		)
 
 		if log_progress and fast_unsafe_targeting:
-			print(
-				"[INT8 Model Adapter] flux2_fast_unsafe selected; using upstream-style plain nn.Linear "
-				"targeting and the less conservative Flux2 exclusion preset."
+			logging.info(
+				"Quantization Model Adapter: flux2_fast_unsafe selected; using upstream-style plain nn.Linear "
+				"targeting and the less conservative Flux2 keep-float preset."
 			)
 		if log_progress and preserve_existing_runtime and (
 			effective_runtime_backend != runtime_backend
 			or effective_small_batch_fallback != small_batch_fallback
-			or effective_prepack_int8_weights != bool(prepack_int8_weights)
+			or effective_prepack_int8_weights != bool(prepack_weights)
 		):
-			print(
-				"[INT8 Model Adapter] Preserving existing INT8 runtime settings from loader "
+			logging.info(
+				"Quantization Model Adapter: preserving existing INT8 runtime settings from loader "
 				f"(backend={effective_runtime_backend}, "
 				f"small_batch_fallback={effective_small_batch_fallback}, "
 				f"prepack_int8_weights={effective_prepack_int8_weights})."
@@ -1241,22 +1427,22 @@ class INT8ModelAdapter:
 
 		candidates = _collect_int8_candidates(
 			diffusion_model,
-			excluded_names,
+			keep_float_names,
 			fast_unsafe=fast_unsafe_targeting,
 		)
-		existing_int8_modules = _collect_existing_int8_modules(diffusion_model, excluded_names)
+		existing_int8_modules = _collect_existing_int8_modules(diffusion_model, keep_float_names)
 		if not candidates and not existing_int8_modules:
 			try:
 				if log_progress:
-					print("[INT8 Model Adapter] No eligible layers found on first scan; forcing model load and rescanning.")
+					logging.info("Quantization Model Adapter: no eligible layers found on the first scan; forcing model load and rescanning.")
 				comfy.model_management.load_models_gpu([model_patcher], force_patch_weights=True, force_full_load=True)
 				diffusion_model = getattr(model_patcher.model, "diffusion_model", diffusion_model)
 				candidates = _collect_int8_candidates(
 					diffusion_model,
-					excluded_names,
+					keep_float_names,
 					fast_unsafe=fast_unsafe_targeting,
 				)
-				existing_int8_modules = _collect_existing_int8_modules(diffusion_model, excluded_names)
+				existing_int8_modules = _collect_existing_int8_modules(diffusion_model, keep_float_names)
 				if existing_int8_modules and not candidates and not preserve_existing_runtime:
 					preserve_existing_runtime = True
 					effective_small_batch_fallback = prior_small_batch_fallback
@@ -1268,18 +1454,39 @@ class INT8ModelAdapter:
 						effective_prepack_int8_weights,
 					)
 			except Exception as e:
-				logging.warning(f"INT8 Model Adapter: forced model load failed during candidate scan ({e}).")
+				logging.warning(f"Quantization Model Adapter: forced model load failed during candidate scan ({e}).")
 
 		if fast_unsafe_targeting and not candidates:
 			candidates = _collect_int8_candidates(
 				diffusion_model,
-				excluded_names,
+				keep_float_names,
 				fast_unsafe=False,
 			)
 			if log_progress and candidates:
-				print(
-					"[INT8 Model Adapter] flux2_fast_unsafe found no raw fast candidates; "
+				logging.info(
+					"Quantization Model Adapter: flux2_fast_unsafe found no raw fast candidates; "
 					"falling back to Comfy linear-like targeting for quantization."
+				)
+
+		int4_compatible_names = [
+			module_name
+			for module_name, module in candidates
+			if is_int4_compatible_linear(getattr(module, "weight", None))
+		]
+		int4_mixed_selected_names = set()
+		if quantization_mode == QUANTIZATION_MODE_INT4_MIXED:
+			int4_mixed_selected_names = set(select_int4_mixed_layers(
+				int4_compatible_names,
+				effective_int4_mixed_ratio,
+				int4_sensitive_names,
+			))
+			if log_progress:
+				logging.info(
+					"Quantization Model Adapter: INT4 mixed profile "
+					f"(compatible={len(int4_compatible_names)}, "
+					f"kept_int8={len(int4_mixed_selected_names)}, "
+					f"ratio={effective_int4_mixed_ratio:.2f}, "
+					f"preset_patterns={len(int4_sensitive_names)})"
 				)
 
 		if candidates:
@@ -1301,14 +1508,14 @@ class INT8ModelAdapter:
 
 		if log_progress:
 			if restored_prior_patch_count:
-				print(f"[INT8 Model Adapter] Restored {restored_prior_patch_count} prior INT8 object patches before requantizing.")
+				logging.info(f"Quantization Model Adapter: restored {restored_prior_patch_count} prior INT8 object patches before requantizing.")
 			if existing_quantized:
-				print(
-					f"[INT8 Model Adapter] Found {existing_quantized} existing INT8 layer(s); "
+				logging.info(
+					f"Quantization Model Adapter: found {existing_quantized} existing INT8 layer(s); "
 					f"baked {baked_existing_int8_patch_count} and configured "
 					f"{max(0, configured_int8_patch_count - baked_existing_int8_patch_count)} pending patch(es)."
 				)
-			print(f"[INT8 Model Adapter] Starting MODEL quantization (eligible linear layers: {total})")
+			logging.info(f"Quantization Model Adapter: starting {quantization_mode} conversion (eligible linear layers: {total}).")
 
 		for index, (module_name, module) in enumerate(candidates, start=1):
 			try:
@@ -1322,12 +1529,14 @@ class INT8ModelAdapter:
 					module_name,
 					module,
 					bool(bake_loaded_loras),
+					bake_deferred=quantization_mode_is_int4(quantization_mode),
 				)
 				q_module, used_quarot = _quantize_linear_module(
 					module_name,
 					module,
 					source_weight,
-					outlier_method,
+					quantization_mode,
+					int4_sensitive=module_name in int4_mixed_selected_names,
 				)
 				model_patcher.add_object_patch(_module_patch_key(module_name), q_module)
 				for patch_key, patch_entries in remaining_patch_entries.items():
@@ -1344,7 +1553,7 @@ class INT8ModelAdapter:
 					baked_lora_count += len(remaining_patch_entries)
 				del source_weight
 			except Exception as e:
-				logging.warning(f"INT8 Model Adapter: skipped {module_name} ({e}).")
+				logging.warning(f"Quantization Model Adapter: skipped {module_name} ({e}).")
 
 			if (index % 8) == 0:
 				_cleanup_torch_memory()
@@ -1354,8 +1563,8 @@ class INT8ModelAdapter:
 				bucket = percent // 5
 				if bucket != last_bucket:
 					last_bucket = bucket
-					print(
-						f"[INT8 Model Adapter] {percent:3d}% "
+					logging.info(
+						f"Quantization Model Adapter: {percent:3d}% "
 						f"({index}/{total}) quantized={quantized} "
 						f"baked_patches={baked_lora_count} "
 						f"skipped_patched={skipped_patched_count} "
@@ -1371,13 +1580,18 @@ class INT8ModelAdapter:
 			"model_type": resolved_model_type,
 			"requested_model_type": model_type,
 			"bake_loaded_loras": bool(bake_loaded_loras),
-			"outlier_method": outlier_method,
+			"quantization_mode": quantization_mode,
+			"keep_float_patterns": tuple(keep_float_names),
+			"int4_sensitive_patterns": tuple(int4_sensitive_names),
+			"int4_mixed_ratio": effective_int4_mixed_ratio,
+			"requested_int4_mixed_ratio": int4_mixed_ratio,
+			"int4_mixed_selected_layers": tuple(sorted(int4_mixed_selected_names)),
 			"small_batch_fallback": effective_small_batch_fallback,
 			"runtime_backend": effective_runtime_backend,
 			"prepack_int8_weights": bool(effective_prepack_int8_weights),
 			"requested_small_batch_fallback": small_batch_fallback,
 			"requested_runtime_backend": runtime_backend,
-			"requested_prepack_int8_weights": bool(prepack_int8_weights),
+			"requested_prepack_weights": bool(prepack_weights),
 			"preserved_existing_runtime": bool(preserve_existing_runtime),
 			"fast_unsafe_targeting": bool(fast_unsafe_targeting),
 			"log_progress": bool(log_progress),
@@ -1398,7 +1612,8 @@ class INT8ModelAdapter:
 				source_model_patcher,
 				resolved_model_type,
 				model_type,
-				outlier_method,
+				quantization_mode,
+				effective_int4_mixed_ratio,
 				effective_small_batch_fallback,
 				effective_runtime_backend,
 				effective_prepack_int8_weights,
@@ -1415,24 +1630,24 @@ class INT8ModelAdapter:
 		if quantized == 0 and existing_quantized == 0 and skipped_patched_count > 0:
 			if total > 0 and skipped_patched_count == total:
 				logging.warning(
-					"INT8 Model Adapter: all eligible layers had pending patches and bake_loaded_loras is disabled; "
+					"Quantization Model Adapter: all eligible layers had pending patches and bake_loaded_loras is disabled; "
 					"no layers were quantized. Enable bake_loaded_loras or remove upstream merge/LoRA patches."
 				)
 			else:
 				logging.warning(
-					f"INT8 Model Adapter: {skipped_patched_count} eligible layer(s) had pending patches and "
+					f"Quantization Model Adapter: {skipped_patched_count} eligible layer(s) had pending patches and "
 					"bake_loaded_loras is disabled; no layers were quantized. Enable bake_loaded_loras or remove "
 					"upstream merge/LoRA patches."
 				)
 			logging.warning(
-				"INT8 Model Adapter: This MODEL output is not INT8-converted; later dtype/runtime errors are likely "
-				"outside the INT8 forward path."
+				"Quantization Model Adapter: no layers were converted; later dtype/runtime errors are likely "
+				"outside the quantized forward path."
 			)
 
 		if log_progress:
-			print(
-				"[INT8 Model Adapter] Complete "
-				f"(quantized={quantized}, existing_int8={existing_quantized}, "
+			logging.info(
+				"Quantization Model Adapter: complete "
+				f"(mode={quantization_mode}, quantized={quantized}, existing_quantized={existing_quantized}, "
 				f"baked_patches={baked_lora_count}, configured_int8_patches={configured_int8_patch_count}, "
 				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count}, "
 				f"backend={effective_runtime_backend}, small_batch_fallback={effective_small_batch_fallback}, "
@@ -1440,7 +1655,7 @@ class INT8ModelAdapter:
 				f"bake_loaded_loras={bool(bake_loaded_loras)})"
 			)
 			if compile_wrapper_removed:
-				print("[INT8 Model Adapter] Removed torch.compile wrapper after requantization.")
+				logging.info("Quantization Model Adapter: removed the torch.compile wrapper after requantization.")
 
 		return (model_patcher,)
 
@@ -1450,5 +1665,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-	"INT8ModelAdapter": "Enable INT8 on MODEL",
+	"INT8ModelAdapter": "Enable Quantization on MODEL",
 }

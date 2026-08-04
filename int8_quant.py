@@ -6,6 +6,21 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import comfy.model_management
 
+from .int4_compile_compat import native_int4_linear
+from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
+from .quantization_policy import is_int4_compatible_linear
+from .quantization_policy import normalize_int4_mixed_ratio
+from .quantization_policy import normalize_layer_name
+from .quantization_policy import select_int4_mixed_layers
+
+try:
+    from comfy.quant_ops import QuantizedTensor, TensorCoreConvRotW4A4Layout
+    _NATIVE_INT4_AVAILABLE = True
+except (ImportError, AttributeError):
+    QuantizedTensor = None
+    TensorCoreConvRotW4A4Layout = None
+    _NATIVE_INT4_AVAILABLE = False
+
 _INT8_FORCE_DISABLE_TORCH_COMPILE = os.environ.get("INT8_FORCE_DISABLE_TORCH_COMPILE", "0") == "1"
 _INT8_FILE_SLICE_LOAD_ENABLED = os.environ.get("INT8_FILE_SLICE_LOAD", "1") != "0"
 _INT8_FILE_SLICE_LOAD_WARNED = False
@@ -34,7 +49,7 @@ try:
 except ImportError:
     TRITON_ROWWISE_QUANT_MAX_COLS = 8192
     _TRITON_AVAILABLE = False
-    print("Triton not found, falling back to torch._int_mm")
+    logging.info("Quantization Toolkit INT8: Triton was not found; falling back to torch._int_mm.")
 
 try:
     from .quarot import build_hadamard as _quarot_build_hadamard
@@ -105,6 +120,20 @@ OUTLIER_METHOD_NONE = "none"
 OUTLIER_METHOD_QUAROT = "quarot"
 OUTLIER_METHOD_CONVROT = "convrot"
 OUTLIER_METHOD_HADANORM = "hadanorm"
+QUANTIZATION_MODE_INT8 = "int8"
+QUANTIZATION_MODE_INT8_CONVROT = "int8_convrot"
+QUANTIZATION_MODE_INT8_QUAROT = "int8_quarot"
+QUANTIZATION_MODE_INT8_HADANORM = "int8_hadanorm"
+QUANTIZATION_MODE_INT4_MIXED = "int4_mixed"
+QUANTIZATION_MODE_INT4_FULL = "int4_full"
+QUANTIZATION_MODE_CHOICES = [
+    QUANTIZATION_MODE_INT8,
+    QUANTIZATION_MODE_INT8_CONVROT,
+    QUANTIZATION_MODE_INT8_QUAROT,
+    QUANTIZATION_MODE_INT8_HADANORM,
+    QUANTIZATION_MODE_INT4_MIXED,
+    QUANTIZATION_MODE_INT4_FULL,
+]
 OUTLIER_METHOD_CHOICES = [
     OUTLIER_METHOD_NONE,
     OUTLIER_METHOD_CONVROT,
@@ -116,6 +145,7 @@ _CONVROT_GROUP_SIZE = 256
 _QUAROT_OFFSET_WARNED: set[tuple[int, int, int] | str] = set()
 _HADANORM_ALPHA = 0.5
 _HADANORM_EPS = 1e-6
+_INT4_QUANT_GROUP_SIZE = 64
 
 try:
     _DYNAMIC_LORA_BATCH_MAX_RANK = max(64, int(os.environ.get("INT8_DYNAMIC_LORA_BATCH_MAX_RANK", "4096")))
@@ -188,6 +218,72 @@ def _normalize_outlier_method(method) -> str:
     if normalized in OUTLIER_METHOD_CHOICES:
         return normalized
     return OUTLIER_METHOD_NONE
+
+def normalize_quantization_mode(mode) -> str:
+    if not isinstance(mode, str):
+        return QUANTIZATION_MODE_INT8
+
+    normalized = mode.strip().lower()
+    if normalized in QUANTIZATION_MODE_CHOICES:
+        return normalized
+    return QUANTIZATION_MODE_INT8
+
+def quantization_mode_outlier_method(mode) -> str:
+    normalized = normalize_quantization_mode(mode)
+    return {
+        QUANTIZATION_MODE_INT8_CONVROT: OUTLIER_METHOD_CONVROT,
+        QUANTIZATION_MODE_INT8_QUAROT: OUTLIER_METHOD_QUAROT,
+        QUANTIZATION_MODE_INT8_HADANORM: OUTLIER_METHOD_HADANORM,
+    }.get(normalized, OUTLIER_METHOD_NONE)
+
+def quantization_mode_is_int4(mode) -> bool:
+    return normalize_quantization_mode(mode) in (
+        QUANTIZATION_MODE_INT4_MIXED,
+        QUANTIZATION_MODE_INT4_FULL,
+    )
+
+def native_int4_available() -> bool:
+    return _NATIVE_INT4_AVAILABLE
+
+def _is_native_int4_tensor(value) -> bool:
+    return bool(
+        _NATIVE_INT4_AVAILABLE
+        and isinstance(value, QuantizedTensor)
+        and getattr(value, "_layout_cls", None) == "TensorCoreConvRotW4A4Layout"
+    )
+
+def _make_native_int4_tensor(qdata, scale, orig_dtype, orig_shape, convrot_groupsize=256, linear_dtype="int4"):
+    if not _NATIVE_INT4_AVAILABLE:
+        raise RuntimeError("Native INT4 requires a recent ComfyUI and comfy-kitchen installation")
+
+    params = TensorCoreConvRotW4A4Layout.Params(
+        scale=scale,
+        orig_dtype=orig_dtype,
+        orig_shape=tuple(orig_shape),
+        convrot_groupsize=int(convrot_groupsize),
+        quant_group_size=_INT4_QUANT_GROUP_SIZE,
+        linear_dtype=str(linear_dtype),
+    )
+    return QuantizedTensor(qdata, "TensorCoreConvRotW4A4Layout", params)
+
+def quantize_native_int4(weight, linear_dtype="int4", stochastic_rounding=0):
+    if not _NATIVE_INT4_AVAILABLE:
+        raise RuntimeError("Native INT4 requires a recent ComfyUI and comfy-kitchen installation")
+    if weight.ndim != 2:
+        raise ValueError("ConvRot W4A4 requires a two-dimensional weight")
+    if weight.shape[1] % _CONVROT_GROUP_SIZE != 0:
+        raise ValueError(
+            f"ConvRot W4A4 in_features={weight.shape[1]} is not divisible by {_CONVROT_GROUP_SIZE}"
+        )
+
+    return QuantizedTensor.from_float(
+        weight,
+        "TensorCoreConvRotW4A4Layout",
+        convrot_groupsize=_CONVROT_GROUP_SIZE,
+        quant_group_size=_INT4_QUANT_GROUP_SIZE,
+        stochastic_rounding=stochastic_rounding,
+        linear_dtype=linear_dtype,
+    )
 
 def _get_module_outlier_method(module) -> str:
     method = _normalize_outlier_method(getattr(module, "_outlier_method", None))
@@ -382,6 +478,18 @@ def _torch_int_mm_safe(a: Tensor, b: Tensor, output_columns: int | None = None) 
 
     return torch._int_mm(a, b)[:rows, :columns]
 
+def _torch_int_mm_dispatch(a: Tensor, b: Tensor, output_columns: int | None = None) -> Tensor:
+    """Use the native fast path when CUDA's alignment constraints are already met."""
+    columns = int(output_columns) if output_columns is not None else int(b.shape[1])
+    if (
+        (not a.is_cuda or int(a.shape[0]) > 16)
+        and int(a.shape[1]) == int(b.shape[0])
+        and int(a.shape[1]) % 8 == 0
+        and columns % 8 == 0
+    ):
+        return torch._int_mm(a, b)
+    return _torch_int_mm_safe(a, b, output_columns=columns)
+
 def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
     """
     Quantize a delta tensor to INT8 using stochastic rounding.
@@ -441,7 +549,7 @@ def int8_forward_dynamic(
     
     # INT8 Matmul (Outputs Int32)
     matmul_weight = weight_int_mm if isinstance(weight_int_mm, torch.Tensor) else weight.T
-    res = _torch_int_mm_safe(x_8, matmul_weight, output_columns=weight.shape[0])
+    res = _torch_int_mm_dispatch(x_8, matmul_weight, output_columns=weight.shape[0])
     
     # Dequantize: (res * weight_scale * x_scale)
     # Note: Creating intermediate Float tensors here is VRAM heavy
@@ -479,7 +587,7 @@ def int8_forward_dynamic_per_row(
 
     # INT8 Matmul (Outputs Int32)
     matmul_weight = weight_int_mm if isinstance(weight_int_mm, torch.Tensor) else weight.T
-    res = _torch_int_mm_safe(x_8, matmul_weight, output_columns=weight.shape[0])
+    res = _torch_int_mm_dispatch(x_8, matmul_weight, output_columns=weight.shape[0])
 
     # Dequantize with per-row weight scales
     # res[i, j] = sum_k(x_8[i, k] * weight[j, k]) * x_scale[i] * weight_scale[j]
@@ -488,6 +596,29 @@ def int8_forward_dynamic_per_row(
     if bias is not None:
         res_scaled = res_scaled + bias.to(compute_dtype)
     return res_scaled
+
+def _native_int8_convrot_linear(
+    x: Tensor,
+    weight: Tensor,
+    weight_scale: Tensor,
+    bias: Tensor | None,
+    compute_dtype: torch.dtype,
+    group_size: int,
+) -> Tensor:
+    dtype_code = {
+        torch.float32: 0,
+        torch.float16: 1,
+        torch.bfloat16: 2,
+    }[compute_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(
+        x.contiguous(),
+        weight.contiguous(),
+        weight_scale,
+        bias,
+        dtype_code,
+        True,
+        group_size,
+    )
 
 def _normalize_dynamic_offset(offset):
     if offset is None:
@@ -642,8 +773,8 @@ def apply_dynamic_lora_delta(
                 if dim == 1:
                     if not (start >= 0 and length > 0 and (start + length) <= x_input.shape[-1]):
                         if _DYNAMIC_LORA_DEBUG:
-                            print(
-                                f"[INT8 Dynamic LoRA] skipping invalid input offset={offset_key} "
+                            logging.info(
+                                f"Quantization Toolkit Dynamic LoRA: skipping invalid input offset={offset_key} "
                                 f"for x shape={tuple(x_input.shape)}"
                             )
                         continue
@@ -653,8 +784,8 @@ def apply_dynamic_lora_delta(
                 elif dim == 0:
                     if not (start >= 0 and length > 0 and (start + length) <= y.shape[-1]):
                         if _DYNAMIC_LORA_DEBUG:
-                            print(
-                                f"[INT8 Dynamic LoRA] skipping invalid output offset={offset_key} "
+                            logging.info(
+                                f"Quantization Toolkit Dynamic LoRA: skipping invalid output offset={offset_key} "
                                 f"for y shape={tuple(y.shape)}"
                             )
                         continue
@@ -688,8 +819,8 @@ def apply_dynamic_lora_delta(
                 else:
                     if lora_y.shape[-1] != y.shape[-1]:
                         if _DYNAMIC_LORA_DEBUG:
-                            print(
-                                f"[INT8 Dynamic LoRA] skipping mismatched batched add "
+                            logging.info(
+                                f"Quantization Toolkit Dynamic LoRA: skipping mismatched batched add "
                                 f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset_key}"
                             )
                         continue
@@ -709,8 +840,8 @@ def apply_dynamic_lora_delta(
                 if dim == 0:
                     if lora_y.shape[-1] != length:
                         if _DYNAMIC_LORA_DEBUG:
-                            print(
-                                f"[INT8 Dynamic LoRA] skipping mismatched output slice "
+                            logging.info(
+                                f"Quantization Toolkit Dynamic LoRA: skipping mismatched output slice "
                                 f"offset={offset_key} lora_y={tuple(lora_y.shape)} y={tuple(y.shape)}"
                             )
                         continue
@@ -721,8 +852,8 @@ def apply_dynamic_lora_delta(
 
                 if lora_y.shape[-1] != y.shape[-1]:
                     if _DYNAMIC_LORA_DEBUG:
-                        print(
-                            f"[INT8 Dynamic LoRA] skipping mismatched full add "
+                        logging.info(
+                            f"Quantization Toolkit Dynamic LoRA: skipping mismatched full add "
                             f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset_key}"
                         )
                     continue
@@ -939,7 +1070,7 @@ def _transform_weight_like_for_outlier_method(
         if key not in _QUAROT_OFFSET_WARNED:
             _QUAROT_OFFSET_WARNED.add(key)
             logging.warning(
-                f"[INT8 {method}] skipping transform for unsupported offset={normalized} "
+                f"Quantization Toolkit INT8 {method}: skipping transform for unsupported offset={normalized} "
                 f"weight_shape={tuple(weight_like.shape)}"
             )
         return weight_like
@@ -951,7 +1082,7 @@ def _transform_weight_like_for_outlier_method(
             sigma = _get_effective_hadanorm_sigma(hadanorm_sigma, weight_like.shape[1], offset=offset)
             if sigma is None:
                 logging.warning(
-                    f"[INT8 HadaNorm] missing sigma for transformed weight_shape={tuple(weight_like.shape)} "
+                    f"Quantization Toolkit INT8 HadaNorm: missing sigma for transformed weight_shape={tuple(weight_like.shape)} "
                     f"offset={_normalize_dynamic_offset(offset)}"
                 )
                 return weight_like
@@ -1039,13 +1170,33 @@ try:
 except ImportError:
     _WEIGHT_ADAPTER_BASE_AVAILABLE = False
 
+_ADAPTER_STATE_UNSET = object()
+_INT8_LORA_PATCH_PAYLOAD = "quantization_toolkit_int8_lora_patch_v1"
+_INT8_MERGED_LORA_PATCH_PAYLOAD = "quantization_toolkit_int8_merged_lora_patch_v1"
+_INT8_WEIGHT_PATCH_PAYLOAD = "quantization_toolkit_int8_weight_patch_v1"
+
+
+def _is_int8_adapter_payload(value, marker):
+    return isinstance(value, (tuple, list)) and len(value) >= 1 and value[0] == marker
+
 if _LORA_ADAPTER_AVAILABLE:
     class INT8LoRAPatchAdapter(LoRAAdapter):
         """
         Specialized LoRA adapter that patches INT8 weights IN-PLACE in INT8 space.
         """
-        def __init__(self, loaded_keys, weights, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
-            super().__init__(loaded_keys, weights)
+        def __init__(self, loaded_keys, weights, weight_scale=_ADAPTER_STATE_UNSET, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
+            if _is_int8_adapter_payload(weights, _INT8_LORA_PATCH_PAYLOAD):
+                payload = weights
+                weights = payload[1]
+                if weight_scale is _ADAPTER_STATE_UNSET:
+                    weight_scale = payload[2]
+                    seed = payload[3]
+                    outlier_method = payload[4]
+                    hadanorm_sigma = payload[5]
+            elif weight_scale is _ADAPTER_STATE_UNSET:
+                weight_scale = 1.0
+
+            self.lora_weights = weights
             self.weight_scale = weight_scale
             self.seed = seed
             resolved_method = _normalize_outlier_method(outlier_method)
@@ -1053,10 +1204,23 @@ if _LORA_ADAPTER_AVAILABLE:
                 resolved_method = OUTLIER_METHOD_QUAROT
             self.outlier_method = resolved_method
             self.hadanorm_sigma = hadanorm_sigma
+            payload = (
+                _INT8_LORA_PATCH_PAYLOAD,
+                self.lora_weights,
+                self.weight_scale,
+                self.seed,
+                self.outlier_method,
+                self.hadanorm_sigma,
+            )
+            super().__init__(loaded_keys, payload)
+            self.base_adapter = LoRAAdapter(loaded_keys, self.lora_weights)
+
+        def calculate_shape(self, key):
+            return self.base_adapter.calculate_shape(key)
 
         def _calculate_weight_fallback(self, weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype != torch.int8:
-                return super().calculate_weight(
+                return self.base_adapter.calculate_weight(
                     weight,
                     key,
                     strength,
@@ -1073,7 +1237,7 @@ if _LORA_ADAPTER_AVAILABLE:
             base_weight_f = dequantize(weight.to(comp_device), effective_scale).to(intermediate_dtype)
             original_base_f = base_weight_f.clone()
 
-            patched_weight_f = super().calculate_weight(
+            patched_weight_f = self.base_adapter.calculate_weight(
                 base_weight_f,
                 key,
                 strength,
@@ -1102,7 +1266,7 @@ if _LORA_ADAPTER_AVAILABLE:
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             device = weight.device
             comp_device = _get_int8_compute_device(device)
-            lora_diff = _compute_fast_lora_diff(self.weights, weight.shape, comp_device, intermediate_dtype)
+            lora_diff = _compute_fast_lora_diff(self.lora_weights, weight.shape, comp_device, intermediate_dtype)
 
             if lora_diff is None:
                 return self._calculate_weight_fallback(
@@ -1116,7 +1280,7 @@ if _LORA_ADAPTER_AVAILABLE:
                     original_weight,
                 )
 
-            scale = _compute_lora_scale(self.weights, strength)
+            scale = _compute_lora_scale(self.lora_weights, strength)
             if weight.dtype == torch.int8:
                 delta_f = lora_diff * scale
                 del lora_diff
@@ -1140,12 +1304,21 @@ if _LORA_ADAPTER_AVAILABLE:
         Adapter that merges multiple LoRAs in float space BEFORE applying a single
         stochastic rounding step. This is much more precise for LoRA stacks.
         """
-        def __init__(self, patches, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
+        def __init__(self, patches, weight_scale=_ADAPTER_STATE_UNSET, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
+            if _is_int8_adapter_payload(weight_scale, _INT8_MERGED_LORA_PATCH_PAYLOAD):
+                payload = weight_scale
+                patches = payload[1]
+                weight_scale = payload[2]
+                seed = payload[3]
+                outlier_method = payload[4]
+                hadanorm_sigma = payload[5]
+            elif weight_scale is _ADAPTER_STATE_UNSET:
+                weight_scale = 1.0
+
             # We need to satisfy the base LoRAAdapter constructor.
             # We use the first patch's keys/weights as a reference.
             first_patch_adapter = patches[0][0]
-            super().__init__(first_patch_adapter.loaded_keys, first_patch_adapter.weights)
-            
+
             # patches is a list of (adapter, strength)
             self.patches = patches
             self.weight_scale = weight_scale
@@ -1155,6 +1328,25 @@ if _LORA_ADAPTER_AVAILABLE:
                 resolved_method = OUTLIER_METHOD_QUAROT
             self.outlier_method = resolved_method
             self.hadanorm_sigma = hadanorm_sigma
+            payload = (
+                _INT8_MERGED_LORA_PATCH_PAYLOAD,
+                self.patches,
+                self.weight_scale,
+                self.seed,
+                self.outlier_method,
+                self.hadanorm_sigma,
+            )
+            super().__init__(first_patch_adapter.loaded_keys, payload)
+
+        def calculate_shape(self, key):
+            for adapter, _strength in self.patches:
+                calculate_shape = getattr(adapter, "calculate_shape", None)
+                if not callable(calculate_shape):
+                    continue
+                shape = calculate_shape(key)
+                if shape is not None:
+                    return shape
+            return None
 
         def _calculate_weight_fallback(self, weight, key, strength_model, offset, function, intermediate_dtype, original_weight):
             if weight.dtype == torch.int8:
@@ -1262,7 +1454,17 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
     class INT8WeightPatchAdapter(WeightAdapterBase):
         name = "int8_weight_patch"
 
-        def __init__(self, base_adapter, weight_scale, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
+        def __init__(self, base_adapter, weight_scale=_ADAPTER_STATE_UNSET, seed=0, use_quarot=False, outlier_method=None, hadanorm_sigma=None):
+            if _is_int8_adapter_payload(weight_scale, _INT8_WEIGHT_PATCH_PAYLOAD):
+                payload = weight_scale
+                base_adapter = payload[1]
+                weight_scale = payload[2]
+                seed = payload[3]
+                outlier_method = payload[4]
+                hadanorm_sigma = payload[5]
+            elif weight_scale is _ADAPTER_STATE_UNSET:
+                weight_scale = 1.0
+
             self.base_adapter = base_adapter
             self.weight_scale = weight_scale
             self.seed = seed
@@ -1272,7 +1474,18 @@ if _WEIGHT_ADAPTER_BASE_AVAILABLE:
             self.outlier_method = resolved_method
             self.hadanorm_sigma = hadanorm_sigma
             self.loaded_keys = getattr(base_adapter, "loaded_keys", set())
-            self.weights = getattr(base_adapter, "weights", ())
+            self.weights = (
+                _INT8_WEIGHT_PATCH_PAYLOAD,
+                self.base_adapter,
+                self.weight_scale,
+                self.seed,
+                self.outlier_method,
+                self.hadanorm_sigma,
+            )
+
+        def calculate_shape(self, key):
+            calculate_shape = getattr(self.base_adapter, "calculate_shape", None)
+            return calculate_shape(key) if callable(calculate_shape) else None
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             if weight.dtype != torch.int8:
@@ -1326,6 +1539,125 @@ else:
 # =============================================================================
 # Dynamic LoRA Synchronization Hook
 # =============================================================================
+
+_NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE = "_quantization_toolkit_dynamic_lora_hook"
+_NATIVE_DYNAMIC_LORA_FORMATS = ("int8_tensorwise", "convrot_w4a4")
+
+
+def _is_native_dynamic_lora_module(module):
+    return bool(
+        getattr(module, "quant_format", None) in _NATIVE_DYNAMIC_LORA_FORMATS
+        and not getattr(module, "_is_quantized", False)
+    )
+
+
+def _native_dynamic_lora_forward_hook(module, input_args, input_kwargs, output):
+    dynamic_entries = getattr(module, "dynamic_lora_entries", None)
+    if not dynamic_entries:
+        return output
+
+    input_tensor = input_args[0] if input_args else input_kwargs.get("input", None)
+    if not isinstance(input_tensor, torch.Tensor) or not isinstance(output, torch.Tensor):
+        return output
+
+    return apply_dynamic_lora_delta(
+        x_input=input_tensor,
+        y=output,
+        lora_A=None,
+        lora_B=None,
+        lora_alpha=None,
+        lora_entries=dynamic_entries,
+        device=input_tensor.device,
+    )
+
+
+def _ensure_native_dynamic_lora_runtime(module):
+    if not _is_native_dynamic_lora_module(module):
+        return False
+
+    if not hasattr(module, _NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE):
+        hook_handle = module.register_forward_hook(
+            _native_dynamic_lora_forward_hook,
+            with_kwargs=True,
+        )
+        setattr(module, _NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE, hook_handle)
+
+    if not hasattr(module, "dynamic_lora_entries"):
+        module.dynamic_lora_entries = None
+    if not hasattr(module, "lora_A"):
+        module.lora_A = None
+    if not hasattr(module, "lora_B"):
+        module.lora_B = None
+    if not hasattr(module, "lora_alpha"):
+        module.lora_alpha = None
+
+    return True
+
+
+def _materialize_native_dynamic_lora_entries(entries, device):
+    grouped_entries = {}
+    for entry in entries:
+        offset = _normalize_dynamic_offset(entry.get("offset"))
+        grouped_entries.setdefault(offset, []).append(entry)
+
+    materialized_entries = []
+    for offset, offset_entries in grouped_entries.items():
+        prepared_entries = [
+            (entry, entry["A"], entry["B"])
+            for entry in offset_entries
+        ]
+        output_length = offset[2] if offset is not None and offset[0] == 0 else None
+        source_devices = {
+            tensor.device
+            for _entry, lora_A, lora_B in prepared_entries
+            for tensor in (lora_A, lora_B)
+        }
+        if len(source_devices) == 1 and _can_batch_dynamic_entries(prepared_entries, output_length):
+            combined_A = torch.cat([lora_A for _entry, lora_A, _lora_B in prepared_entries], dim=0)
+            combined_B = torch.cat([lora_B for _entry, _lora_A, lora_B in prepared_entries], dim=1)
+            materialized_entries.append({
+                "A": combined_A.to(device),
+                "B": combined_B.to(device),
+                "offset": offset,
+            })
+            continue
+
+        materialized_entries.extend(
+            {
+                "A": lora_A.to(device),
+                "B": lora_B.to(device),
+                "offset": offset,
+            }
+            for _entry, lora_A, lora_B in prepared_entries
+        )
+
+    return materialized_entries
+
+
+def _iter_dynamic_lora_modules(root_module):
+    """Traverse the effective module tree, including hidden lazy-compile sources."""
+    visited_module_ids = set()
+
+    def walk(module_name, module):
+        # Quantized Lazy Torch Compile intentionally keeps its source module
+        # unregistered. Treat that source as occupying the proxy's original path
+        # so ComfyUI patch keys continue to match during the temporary swap.
+        source_module = getattr(module, "_source_module", None)
+        if isinstance(source_module, nn.Module) and source_module is not module:
+            yield from walk(module_name, source_module)
+            return
+
+        module_id = id(module)
+        if module_id in visited_module_ids:
+            return
+        visited_module_ids.add(module_id)
+
+        yield module_name, module
+        for child_name, child_module in module.named_children():
+            qualified_name = f"{module_name}.{child_name}" if module_name else child_name
+            yield from walk(qualified_name, child_module)
+
+    yield from walk("", root_module)
 
 class DynamicLoRAHook:
     """
@@ -1454,6 +1786,10 @@ class DynamicLoRAHook:
                 name = name[len("model.diffusion_model."):]
             elif name.startswith("model."):
                 name = name[len("model."):]
+
+            while name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+            name = name.replace("._orig_mod.", ".")
             return name
 
         # Pre-group patches by layer
@@ -1473,7 +1809,12 @@ class DynamicLoRAHook:
         # Update all modules
         candidate_modules = 0
         matched_modules = 0
-        for name, module in diffusion_model.named_modules():
+        native_runtime_modules = 0
+        for name, module in _iter_dynamic_lora_modules(diffusion_model):
+            uses_native_dynamic_runtime = _ensure_native_dynamic_lora_runtime(module)
+            if uses_native_dynamic_runtime:
+                native_runtime_modules += 1
+
             if not hasattr(module, "lora_A"):
                 continue
             candidate_modules += 1
@@ -1496,14 +1837,14 @@ class DynamicLoRAHook:
             for adapter, strength, offset in patches:
                 if not _LORA_ADAPTER_AVAILABLE or not isinstance(adapter, LoRAAdapter):
                     if _DYNAMIC_LORA_DEBUG:
-                        logging.warning(f"[INT8 Dynamic LoRA] skipping non-LoRA adapter for module={normalized_name}")
+                        logging.warning(f"Quantization Toolkit Dynamic LoRA: skipping non-LoRA adapter for module={normalized_name}.")
                     continue
 
                 factors = _compute_dynamic_lora_factors(adapter.weights, strength)
                 if factors is None:
                     if _DYNAMIC_LORA_DEBUG:
                         logging.warning(
-                            f"[INT8 Dynamic LoRA] skipping unsupported LoRA format for module={normalized_name} "
+                            f"Quantization Toolkit Dynamic LoRA: skipping unsupported LoRA format for module={normalized_name} "
                             f"offset={offset}"
                         )
                     continue
@@ -1526,14 +1867,17 @@ class DynamicLoRAHook:
             if entries:
                 module_weight = getattr(module, "weight", None)
                 device = module_weight.device if isinstance(module_weight, torch.Tensor) else torch.device("cpu")
-                module.dynamic_lora_entries = [
-                    {
-                        "A": entry["A"].to(device),
-                        "B": entry["B"].to(device),
-                        "offset": entry["offset"],
-                    }
-                    for entry in entries
-                ]
+                if uses_native_dynamic_runtime:
+                    module.dynamic_lora_entries = _materialize_native_dynamic_lora_entries(entries, device)
+                else:
+                    module.dynamic_lora_entries = [
+                        {
+                            "A": entry["A"].to(device),
+                            "B": entry["B"].to(device),
+                            "offset": entry["offset"],
+                        }
+                        for entry in entries
+                    ]
             else:
                 module.dynamic_lora_entries = None
 
@@ -1542,10 +1886,21 @@ class DynamicLoRAHook:
             module.lora_B = None
             module.lora_alpha = None
 
+        if dynamic_loras and matched_modules == 0:
+            logging.warning(
+                "Quantization Toolkit Dynamic LoRA: no compatible quantized layers matched the loaded LoRA patches."
+            )
+        elif dynamic_loras:
+            logging.info(
+                f"Quantization Toolkit Dynamic LoRA: activated {len(dynamic_loras)} LoRA(s) across "
+                f"{matched_modules} quantized layer(s)."
+            )
+
         if _DYNAMIC_LORA_DEBUG:
-            print(
-                f"[INT8 Dynamic LoRA] candidate_modules={candidate_modules} "
-                f"patch_keys={len(layer_patches)} matched_modules={matched_modules}"
+            logging.info(
+                f"Quantization Toolkit Dynamic LoRA: candidate_modules={candidate_modules} "
+                f"patch_keys={len(layer_patches)} matched_modules={matched_modules} "
+                f"native_runtime_modules={native_runtime_modules}"
             )
 
     @classmethod
@@ -1573,9 +1928,13 @@ if _COMFY_OPS_AVAILABLE:
         """
         Custom ComfyUI operations for INT8 tensorwise quantization.
         """
-        excluded_names = []
+        keep_float_names = []
+        int4_sensitive_names = []
+        int4_mixed_selected_names = set()
+        int4_mixed_ratio = DEFAULT_INT4_MIXED_RATIO
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
         outlier_method = OUTLIER_METHOD_NONE
+        quantization_mode = QUANTIZATION_MODE_INT8
         use_triton = True
         runtime_backend = DEFAULT_INT8_BACKEND
         runtime_uses_triton = DEFAULT_INT8_BACKEND in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
@@ -1597,23 +1956,47 @@ if _COMFY_OPS_AVAILABLE:
             cls._otf_progress_quantized = 0
             cls._otf_progress_outlier = 0
             cls._otf_progress_last_bucket = -1
+            cls.int4_mixed_selected_names = set()
 
         @classmethod
-        def _init_otf_progress(cls, state_dict):
+        def _init_otf_progress(cls, state_dict, current_prefix=None, current_weight=None):
             if cls._otf_progress_total is not None:
                 return
 
-            total_estimate = 1
+            weight_entries = []
+            if isinstance(current_weight, torch.Tensor):
+                weight_entries.append((normalize_layer_name(current_prefix), current_weight))
             for key, value in state_dict.items():
                 if not isinstance(value, torch.Tensor):
                     continue
                 if not key.endswith("weight"):
                     continue
                 if value.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(value.dtype):
-                    total_estimate += 1
+                    weight_entries.append((normalize_layer_name(key[:-len("weight")]), value))
+
+            total_estimate = len(weight_entries)
+            if normalize_quantization_mode(cls.quantization_mode) == QUANTIZATION_MODE_INT4_MIXED:
+                compatible_names = [
+                    layer_name
+                    for layer_name, weight in weight_entries
+                    if not any(pattern in layer_name for pattern in cls.keep_float_names)
+                    and is_int4_compatible_linear(weight)
+                ]
+                selected_names = select_int4_mixed_layers(
+                    compatible_names,
+                    cls.int4_mixed_ratio,
+                    cls.int4_sensitive_names,
+                )
+                cls.int4_mixed_selected_names = set(selected_names)
+                logging.info(
+                    "Quantization Toolkit on-the-fly: INT4 mixed profile "
+                    f"(compatible={len(compatible_names)}, "
+                    f"kept_int8={len(selected_names)}, "
+                    f"ratio={normalize_int4_mixed_ratio(cls.int4_mixed_ratio):.2f})"
+                )
 
             cls._otf_progress_total = max(1, int(total_estimate))
-            print(f"[INT8 OTF] Starting quantization scan (estimated layers: {cls._otf_progress_total})")
+            logging.info(f"Quantization Toolkit on-the-fly: starting scan (estimated layers: {cls._otf_progress_total}).")
 
         @classmethod
         def _update_otf_progress(cls, *, quantized: bool, outlier_adjusted: bool):
@@ -1628,8 +2011,8 @@ if _COMFY_OPS_AVAILABLE:
             bucket = percent // 5
             if bucket != cls._otf_progress_last_bucket:
                 cls._otf_progress_last_bucket = bucket
-                print(
-                    f"[INT8 OTF] {percent:3d}% "
+                logging.info(
+                    f"Quantization Toolkit on-the-fly: {percent:3d}% "
                     f"({cls._otf_progress_processed}/{total}) "
                     f"quantized={cls._otf_progress_quantized} "
                     f"outlier_adjusted={cls._otf_progress_outlier}"
@@ -1639,8 +2022,8 @@ if _COMFY_OPS_AVAILABLE:
         def summarize_otf_progress(cls):
             if cls._otf_progress_processed <= 0:
                 return
-            print(
-                "[INT8 OTF] Complete "
+            logging.info(
+                "Quantization Toolkit on-the-fly: complete "
                 f"(processed={cls._otf_progress_processed}, "
                 f"quantized={cls._otf_progress_quantized}, "
                 f"outlier_adjusted={cls._otf_progress_outlier})"
@@ -1650,6 +2033,7 @@ if _COMFY_OPS_AVAILABLE:
         def reset_runtime_stats(cls):
             cls._runtime_stats = {
                 "linear_calls": 0,
+                "comfy_kitchen_convrot": 0,
                 "triton": 0,
                 "triton_legacy_unsafe": 0,
                 "torch_int_mm": 0,
@@ -1671,10 +2055,10 @@ if _COMFY_OPS_AVAILABLE:
             cls._runtime_stats[key] = cls._runtime_stats.get(key, 0) + 1
 
         @classmethod
-        def print_runtime_stats(cls, prefix="[INT8 Runtime]"):
+        def log_runtime_stats(cls, prefix="Quantization Toolkit INT8 runtime:"):
             if not _RUNTIME_STATS_ENABLED:
                 return
-            print(
+            logging.info(
                 f"{prefix} backend={cls.runtime_backend} "
                 f"small_batch_fallback={cls.small_batch_fallback_mode} "
                 f"prepack_int8_weights={cls.prepack_int8_weights} "
@@ -1690,6 +2074,10 @@ if _COMFY_OPS_AVAILABLE:
                 self.register_buffer("quarot_hadamard", None)
                 self.register_buffer("hadanorm_sigma", None)
                 self._is_quantized = False
+                self._quant_format = None
+                self._convrot_groupsize = _CONVROT_GROUP_SIZE
+                self._quant_group_size = _INT4_QUANT_GROUP_SIZE
+                self._linear_dtype = "int4"
                 self._is_per_row = False
                 self._use_quarot = False
                 self._outlier_method = OUTLIER_METHOD_NONE
@@ -1726,9 +2114,41 @@ if _COMFY_OPS_AVAILABLE:
                 _ = state_dict.pop(input_scale_key, None)
                 
                 if weight_tensor is not None:
-                    if weight_tensor.dtype == torch.int8 and weight_scale is not None:
+                    native_quant_format = (
+                        native_quant_config.get("format")
+                        if isinstance(native_quant_config, dict)
+                        else None
+                    )
+                    if native_quant_format == "convrot_w4a4" and weight_scale is not None:
+                        self._is_quantized = True
+                        self._quant_format = "convrot_w4a4"
+                        self._use_quarot = False
+                        self._outlier_method = OUTLIER_METHOD_NONE
+                        self.quarot_hadamard = None
+                        self.hadanorm_sigma = None
+                        self.weight_packed = None
+                        self.weight_int_mm = None
+                        self._convrot_groupsize = int(native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
+                        self._quant_group_size = _INT4_QUANT_GROUP_SIZE
+                        self._linear_dtype = str(native_quant_config.get("linear_dtype", "int4"))
+                        orig_dtype = getattr(self, "weight_comfy_model_dtype", None) or torch.bfloat16
+                        scale = weight_scale.float() if isinstance(weight_scale, torch.Tensor) else torch.tensor(weight_scale, dtype=torch.float32)
+                        self.weight_scale = scale.reshape(-1)
+                        q_weight = _make_native_int4_tensor(
+                            weight_tensor,
+                            self.weight_scale,
+                            orig_dtype,
+                            (self.out_features, self.in_features),
+                            convrot_groupsize=self._convrot_groupsize,
+                            linear_dtype=self._linear_dtype,
+                        )
+                        self.weight = nn.Parameter(q_weight, requires_grad=False)
+                        self._is_per_row = True
+                        Int8TensorwiseOps._is_prequantized = True
+                    elif weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # Load Quantized
                         self._is_quantized = True
+                        self._quant_format = "int8_tensorwise"
                         self._use_quarot = False
                         self.quarot_hadamard = None
                         self.hadanorm_sigma = None
@@ -1778,7 +2198,7 @@ if _COMFY_OPS_AVAILABLE:
                                     self.quarot_hadamard = h_matrix
                                     self._outlier_method = OUTLIER_METHOD_CONVROT
                             except Exception as e:
-                                logging.warning(f"INT8 Toolkit: ConvRot metadata ignored for {prefix} ({e}).")
+                                logging.warning(f"Quantization Toolkit: ConvRot metadata ignored for {prefix} ({e}).")
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight_tensor.dtype):
                         # Load High-Precision
@@ -1802,15 +2222,25 @@ if _COMFY_OPS_AVAILABLE:
 
                         track_progress = Int8TensorwiseOps.dynamic_quantize and not Int8TensorwiseOps._is_prequantized
                         if track_progress:
-                            Int8TensorwiseOps._init_otf_progress(state_dict)
+                            Int8TensorwiseOps._init_otf_progress(
+                                state_dict,
+                                current_prefix=prefix,
+                                current_weight=weight_tensor,
+                            )
 
-                        is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
+                        quantization_mode = normalize_quantization_mode(Int8TensorwiseOps.quantization_mode)
+                        int4_mode = quantization_mode_is_int4(quantization_mode)
+                        keep_float = any(name in prefix for name in Int8TensorwiseOps.keep_float_names)
+                        int4_sensitive = (
+                            normalize_layer_name(prefix) in Int8TensorwiseOps.int4_mixed_selected_names
+                        )
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                         quantized_now = False
                         outlier_adjusted_now = False
                         
-                        if is_excluded or is_dim1 or Int8TensorwiseOps._is_prequantized or not Int8TensorwiseOps.dynamic_quantize:
+                        if keep_float or is_dim1 or Int8TensorwiseOps._is_prequantized or not Int8TensorwiseOps.dynamic_quantize:
                             self._is_quantized = False
+                            self._quant_format = None
                             self._is_per_row = False
                             self._use_quarot = False
                             self.quarot_hadamard = None
@@ -1819,12 +2249,11 @@ if _COMFY_OPS_AVAILABLE:
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                             self.weight_packed = None
                             self.weight_int_mm = None
-                            #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly (per-row, including FP8 -> INT8).
                             device = _get_int8_compute_device(weight_tensor.device)
                             w_gpu = tensor_to_int8_compute_device(weight_tensor, device, non_blocking=True)
-                            outlier_method = _normalize_outlier_method(Int8TensorwiseOps.outlier_method)
+                            outlier_method = quantization_mode_outlier_method(quantization_mode)
                             if _is_float8_dtype(w_gpu.dtype):
                                 w_gpu = w_gpu.to(torch.float16 if device.type == "cuda" else torch.float32)
                             elif outlier_method != OUTLIER_METHOD_NONE and w_gpu.dtype in (torch.float16, torch.bfloat16):
@@ -1833,6 +2262,52 @@ if _COMFY_OPS_AVAILABLE:
                             self.quarot_hadamard = None
                             self.hadanorm_sigma = None
                             self._outlier_method = OUTLIER_METHOD_NONE
+
+                            int4_compatible = (
+                                int4_mode
+                                and _NATIVE_INT4_AVAILABLE
+                                and w_gpu.ndim == 2
+                                and w_gpu.shape[1] % _CONVROT_GROUP_SIZE == 0
+                            )
+                            if int4_compatible and not (
+                                quantization_mode == QUANTIZATION_MODE_INT4_MIXED and int4_sensitive
+                            ):
+                                linear_dtype = "int4"
+                                q_weight = quantize_native_int4(
+                                    w_gpu,
+                                    linear_dtype=linear_dtype,
+                                ).to("cpu")
+                                self.weight = nn.Parameter(q_weight, requires_grad=False)
+                                self.weight_scale = q_weight._params.scale
+                                self.weight_packed = None
+                                self.weight_int_mm = None
+                                self._is_quantized = True
+                                self._quant_format = "convrot_w4a4"
+                                self._is_per_row = True
+                                self._convrot_groupsize = q_weight._params.convrot_groupsize
+                                self._quant_group_size = q_weight._params.quant_group_size
+                                self._linear_dtype = q_weight._params.linear_dtype
+                                quantized_now = True
+                                outlier_adjusted_now = True
+                                if track_progress:
+                                    Int8TensorwiseOps._update_otf_progress(
+                                        quantized=quantized_now,
+                                        outlier_adjusted=outlier_adjusted_now,
+                                    )
+                                bias_tensor = state_dict.pop(bias_key, None)
+                                if bias_tensor is not None:
+                                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
+                                else:
+                                    self.bias = None
+                                return
+
+                            if int4_mode:
+                                # Mixed-mode sensitive layers and W4-incompatible shapes use W8.
+                                outlier_method = (
+                                    OUTLIER_METHOD_CONVROT
+                                    if w_gpu.shape[1] % _CONVROT_GROUP_SIZE == 0
+                                    else OUTLIER_METHOD_NONE
+                                )
 
                             if (
                                 outlier_method != OUTLIER_METHOD_NONE
@@ -1859,8 +2334,6 @@ if _COMFY_OPS_AVAILABLE:
                                     self._outlier_method = OUTLIER_METHOD_NONE
 
                             q_weight, q_scale = quantize_int8_rowwise(w_gpu)
-                            #print("Quantizing", prefix)
-                            
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
                             self.weight_packed = _prepack_int8_weight(self.weight) if self._prepack_int8_weights else None
                             self.weight_int_mm = _prepack_torch_int_mm_weight(self.weight)
@@ -1870,6 +2343,7 @@ if _COMFY_OPS_AVAILABLE:
                                 else torch.tensor([float(q_scale)], dtype=torch.float32)
                             )
                             self._is_quantized = True
+                            self._quant_format = "int8_tensorwise"
                             self._is_per_row = self.weight_scale.dim() == 2 and self.weight_scale.shape[1] == 1
                             quantized_now = True
                             outlier_adjusted_now = self._outlier_method != OUTLIER_METHOD_NONE
@@ -1903,6 +2377,19 @@ if _COMFY_OPS_AVAILABLE:
                 if not getattr(self, "_is_quantized", False):
                     return output
 
+                if self._quant_format == "convrot_w4a4" and _is_native_int4_tensor(self.weight):
+                    params = self.weight._params
+                    output[prefix + "weight"] = self.weight._qdata if keep_vars else self.weight._qdata.detach()
+                    output[prefix + "weight_scale"] = params.scale if keep_vars else params.scale.detach()
+                    quant_config = {
+                        "format": "convrot_w4a4",
+                        "convrot_groupsize": int(params.convrot_groupsize),
+                    }
+                    if params.linear_dtype != "int4":
+                        quant_config["linear_dtype"] = params.linear_dtype
+                    output[prefix + "comfy_quant"] = _encode_comfy_quant_config(quant_config)
+                    return output
+
                 outlier_method = _get_module_outlier_method(self)
                 if outlier_method not in (OUTLIER_METHOD_NONE, OUTLIER_METHOD_CONVROT):
                     return output
@@ -1919,10 +2406,15 @@ if _COMFY_OPS_AVAILABLE:
                 return output
 
             def _replace_weight(self, new_weight, inplace_update=False):
-                if inplace_update:
+                if inplace_update and not _is_native_int4_tensor(new_weight):
                     self.weight.data.copy_(new_weight)
                 else:
                     self.weight = nn.Parameter(new_weight, requires_grad=False)
+                if self._quant_format == "convrot_w4a4":
+                    self.weight_scale = self.weight._params.scale
+                    self.weight_packed = None
+                    self.weight_int_mm = None
+                    return
                 self.weight_packed = (
                     _prepack_int8_weight(self.weight)
                     if self._is_quantized and self._prepack_int8_weights
@@ -1933,6 +2425,9 @@ if _COMFY_OPS_AVAILABLE:
             def convert_weight(self, _weight, inplace=False):
                 if not self._is_quantized:
                     return _weight
+                if self._quant_format == "convrot_w4a4":
+                    source_weight = _weight if _is_native_int4_tensor(_weight) else self.weight
+                    return source_weight.dequantize()
                 target_device = _weight.device if isinstance(_weight, torch.Tensor) else self.weight.device
                 if self.weight.device == target_device:
                     return self.weight.clone()
@@ -1948,6 +2443,21 @@ if _COMFY_OPS_AVAILABLE:
                         self._replace_weight(new_weight, inplace_update=True)
                     else:
                         self._replace_weight(new_weight)
+                    return
+
+                if self._quant_format == "convrot_w4a4":
+                    if _is_native_int4_tensor(out_weight):
+                        new_weight = out_weight
+                    else:
+                        new_weight = self.weight.requantize_from_float(
+                            out_weight,
+                            scale="recalculate",
+                            stochastic_rounding=seed,
+                            inplace_ops=True,
+                        )
+                    if return_weight:
+                        return new_weight
+                    self._replace_weight(new_weight)
                     return
 
                 if out_weight.dtype == torch.int8:
@@ -1993,6 +2503,29 @@ if _COMFY_OPS_AVAILABLE:
                     out = F.linear(x, weight, bias)
                     uncast_bias_weight(self, weight, bias, offload_stream)
                     return out
+
+                if self._quant_format == "convrot_w4a4":
+                    weight, bias, offload_stream = cast_bias_weight(
+                        self,
+                        input=None,
+                        dtype=self.weight.dtype,
+                        device=x.device,
+                        bias_dtype=x.dtype,
+                        offloadable=True,
+                        compute_dtype=x.dtype,
+                        want_requant=True,
+                    )
+                    out = native_int4_linear(x, weight, bias)
+                    uncast_bias_weight(self, weight, bias, offload_stream)
+                    return apply_dynamic_lora_delta(
+                        x_input=x,
+                        y=out,
+                        lora_A=self.lora_A,
+                        lora_B=self.lora_B,
+                        lora_alpha=self.lora_alpha,
+                        lora_entries=self.dynamic_lora_entries,
+                        device=x.device,
+                    )
                 
                 # 1. Move weight/bias/scale to device (non_blocking)
                 weight = self.weight if self.weight.device == x.device else self.weight.to(x.device, non_blocking=True)
@@ -2010,6 +2543,42 @@ if _COMFY_OPS_AVAILABLE:
                 
                 x_shape = x.shape
                 outlier_method = _get_module_outlier_method(self)
+                if outlier_method == OUTLIER_METHOD_CONVROT:
+                    if _RUNTIME_STATS_ENABLED:
+                        Int8TensorwiseOps._increment_runtime_stat("linear_calls")
+                        Int8TensorwiseOps._increment_runtime_stat("comfy_kitchen_convrot")
+                    y_view = _native_int8_convrot_linear(
+                        x,
+                        weight,
+                        w_scale,
+                        bias,
+                        compute_dtype,
+                        self._convrot_groupsize,
+                    )
+                    if self.dynamic_lora_entries or (
+                        isinstance(self.lora_A, torch.Tensor)
+                        and isinstance(self.lora_B, torch.Tensor)
+                    ):
+                        x_transformed, correction_source = _apply_outlier_activation_transform(
+                            x,
+                            outlier_method,
+                            hadamard=self.quarot_hadamard,
+                            hadanorm_sigma=self.hadanorm_sigma,
+                        )
+                    else:
+                        x_transformed = x
+                        correction_source = None
+                    return apply_dynamic_lora_delta(
+                        x_input=x_transformed,
+                        y=y_view,
+                        lora_A=self.lora_A,
+                        lora_B=self.lora_B,
+                        lora_alpha=self.lora_alpha,
+                        lora_entries=self.dynamic_lora_entries,
+                        device=x.device,
+                        correction_x=correction_source,
+                    )
+
                 x_transformed, correction_source = _apply_outlier_activation_transform(
                     x,
                     outlier_method,
@@ -2018,10 +2587,9 @@ if _COMFY_OPS_AVAILABLE:
                 )
                 x_2d = x_transformed.reshape(-1, x_shape[-1])
 
-                runtime_backend = _normalize_runtime_backend(getattr(self, "_runtime_backend", Int8TensorwiseOps.runtime_backend))
-                use_triton = bool(getattr(self, "_runtime_uses_triton", runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)))
-                legacy_triton_unsafe = bool(getattr(self, "_runtime_uses_legacy_triton", runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE))
-                prepack_int8_weights = bool(getattr(self, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights))
+                use_triton = self._runtime_uses_triton
+                legacy_triton_unsafe = self._runtime_uses_legacy_triton
+                prepack_int8_weights = self._prepack_int8_weights
                 weight_packed = (
                     _get_prepacked_weight(self, x.device)
                     if use_triton and prepack_int8_weights
@@ -2044,23 +2612,25 @@ if _COMFY_OPS_AVAILABLE:
                     matmul_bias = None
 
                 if use_small_batch_fallback:
-                    Int8TensorwiseOps._increment_runtime_stat("linear_calls")
-                    Int8TensorwiseOps._increment_runtime_stat("small_batch_fallback")
+                    if _RUNTIME_STATS_ENABLED:
+                        Int8TensorwiseOps._increment_runtime_stat("linear_calls")
+                        Int8TensorwiseOps._increment_runtime_stat("small_batch_fallback")
                     # Small batch fallback
                     w_float = dequantize(weight, w_scale).to(input_2d.dtype)
                     bias_typed = matmul_bias.to(input_2d.dtype) if matmul_bias is not None else None
                     y = F.linear(input_2d, w_float, bias_typed)
                 else:
-                    Int8TensorwiseOps._increment_runtime_stat("linear_calls")
-                    if use_triton:
-                        if legacy_triton_unsafe:
-                            Int8TensorwiseOps._increment_runtime_stat("triton_legacy_unsafe")
+                    if _RUNTIME_STATS_ENABLED:
+                        Int8TensorwiseOps._increment_runtime_stat("linear_calls")
+                        if use_triton:
+                            if legacy_triton_unsafe:
+                                Int8TensorwiseOps._increment_runtime_stat("triton_legacy_unsafe")
+                            else:
+                                Int8TensorwiseOps._increment_runtime_stat("triton")
+                            if isinstance(weight_packed, torch.Tensor):
+                                Int8TensorwiseOps._increment_runtime_stat("prepacked")
                         else:
-                            Int8TensorwiseOps._increment_runtime_stat("triton")
-                        if isinstance(weight_packed, torch.Tensor):
-                            Int8TensorwiseOps._increment_runtime_stat("prepacked")
-                    else:
-                        Int8TensorwiseOps._increment_runtime_stat("torch_int_mm")
+                            Int8TensorwiseOps._increment_runtime_stat("torch_int_mm")
 
                     if self._is_per_row:
                         y = int8_forward_dynamic_per_row(

@@ -9,6 +9,14 @@ import folder_paths
 import torch
 from comfy.cli_args import args
 
+try:
+	from comfy.quant_ops import QuantizedTensor
+except (ImportError, AttributeError):
+	QuantizedTensor = None
+
+
+_SUPPORTED_QUANTIZATION_FORMATS = {"int8_tensorwise", "convrot_w4a4"}
+
 
 def _install_lazy_casting_param_workaround():
 	try:
@@ -54,6 +62,8 @@ def _install_lazy_casting_param_workaround():
 def _is_int8_quantized_module(module):
 	if not getattr(module, "_is_quantized", False):
 		return False
+	if getattr(module, "_quant_format", None) == "convrot_w4a4":
+		return True
 
 	weight = getattr(module, "weight", None)
 	if not isinstance(weight, torch.Tensor):
@@ -62,7 +72,56 @@ def _is_int8_quantized_module(module):
 	return weight.dtype == torch.int8
 
 
+def _is_supported_quantized_module(module):
+	if _is_int8_quantized_module(module):
+		return True
+
+	quant_format = getattr(module, "quant_format", None)
+	if quant_format not in _SUPPORTED_QUANTIZATION_FORMATS:
+		return False
+	weight = getattr(module, "weight", None)
+	return QuantizedTensor is not None and isinstance(weight, QuantizedTensor)
+
+
+def _model_contains_supported_quantization(model_patcher):
+	base_model = getattr(model_patcher, "model", None)
+	if base_model is not None and hasattr(base_model, "modules"):
+		if any(_is_supported_quantized_module(module) for module in base_model.modules()):
+			return True
+
+	for object_patch_map_name in ("object_patches", "object_patches_backup"):
+		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
+		if not isinstance(object_patch_map, dict):
+			continue
+		if any(_is_supported_quantized_module(module) for module in object_patch_map.values()):
+			return True
+
+	return False
+
+
+def _validate_quantized_model(model_patcher):
+	if not _model_contains_supported_quantization(model_patcher):
+		raise ValueError(
+			"Save Quantized Model requires a MODEL containing Toolkit INT8 or native ConvRot INT4 weights. "
+			"Place Enable Quantization on MODEL before Load LoRA (Quantized) and this save node."
+		)
+
+	get_attachment = getattr(model_patcher, "get_attachment", None)
+	if not callable(get_attachment):
+		return
+	lora_signature = get_attachment("int8_lora_signature")
+	if not isinstance(lora_signature, tuple):
+		return
+	if any(isinstance(entry, tuple) and entry and entry[0] == "Dynamic" for entry in lora_signature):
+		raise ValueError(
+			"Save Quantized Model cannot serialize Dynamic LoRAs because they are runtime-only. "
+			"Use Stochastic mode, or bake stock LoRAs before quantization."
+		)
+
+
 def _module_has_non_float_weight(module):
+	if getattr(module, "_quant_format", None) == "convrot_w4a4":
+		return True
 	weight = getattr(module, "weight", None)
 	if not isinstance(weight, torch.Tensor):
 		return False
@@ -190,7 +249,7 @@ def _temporary_save_compatibility_shim(modules):
 	flag_states = _set_comfy_patched_weights_flag(modules)
 	restore_lazy_param = _install_lazy_casting_param_workaround()
 	if restore_lazy_param is not None:
-		print("[INT8 Model Save] Enabled temporary LazyCastingParam requires_grad workaround.")
+		logging.info("Quantization Toolkit save: enabled the temporary LazyCastingParam requires_grad workaround.")
 
 	try:
 		yield
@@ -213,11 +272,11 @@ def _apply_object_patches_for_save(model_patcher):
 		patch_model(load_weights=False)
 		return True
 	except Exception as e:
-		logging.warning(f"INT8 Model Save: failed to apply object patches before save ({e}).")
+		logging.warning(f"Quantization Toolkit Save: failed to apply object patches before save ({e}).")
 		return False
 
 
-def _summarize_saved_int8_checkpoint(path):
+def _summarize_saved_quantized_checkpoint(path):
 	try:
 		from safetensors import safe_open
 	except Exception:
@@ -229,6 +288,8 @@ def _summarize_saved_int8_checkpoint(path):
 		total_weights = 0
 		weight_scales = 0
 		comfy_quant_layers = 0
+		int4_layers = 0
+		int8_layers = 0
 		with safe_open(path, framework="pt", device="cpu") as handle:
 			metadata = handle.metadata()
 			has_legacy_quant_metadata = isinstance(metadata, dict) and "_quantization_metadata" in metadata
@@ -244,27 +305,35 @@ def _summarize_saved_int8_checkpoint(path):
 					weight_scales += 1
 				elif key.endswith(".comfy_quant"):
 					comfy_quant_layers += 1
+					try:
+						quant_config = json.loads(handle.get_tensor(key).numpy().tobytes())
+						if quant_config.get("format") == "convrot_w4a4":
+							int4_layers += 1
+						elif quant_config.get("format") == "int8_tensorwise":
+							int8_layers += 1
+					except Exception:
+						pass
 
-		print(
-			"[INT8 Model Save] Saved checkpoint summary "
+		logging.info(
+			"Quantization Toolkit save: checkpoint summary "
 			f"(int8_weights={int8_weights}, weight_scales={weight_scales}, "
+			f"int4_layers={int4_layers}, int8_layers={int8_layers}, "
 			f"comfy_quant_layers={comfy_quant_layers}, total_weights={total_weights}, "
 			f"dtypes={dtype_counts})."
 		)
 		if int8_weights == 0 or weight_scales == 0:
-			logging.warning("INT8 Model Save: saved checkpoint does not appear to contain INT8 weights.")
+			logging.warning("Quantization Toolkit Save: saved checkpoint does not appear to contain packed INT4 or INT8 weights.")
 		elif comfy_quant_layers == 0 and not has_legacy_quant_metadata:
 			logging.warning(
-				"INT8 Model Save: saved checkpoint does not include native ComfyUI .comfy_quant metadata. "
-				"Load it with the Toolkit INT8 loader until native-format export is implemented."
+				"Quantization Toolkit Save: saved checkpoint does not include native ComfyUI .comfy_quant metadata."
 			)
 		elif comfy_quant_layers < int8_weights and not has_legacy_quant_metadata:
 			logging.warning(
-				"INT8 Model Save: only some INT8 weights include native ComfyUI .comfy_quant metadata. "
+				"Quantization Toolkit Save: only some packed weights include native ComfyUI .comfy_quant metadata. "
 				"Plain INT8 and ConvRot layers can export natively; Toolkit QuaRot/HadaNorm layers require the Toolkit loader."
 			)
 	except Exception as e:
-		logging.warning(f"INT8 Model Save: failed to inspect saved checkpoint ({e}).")
+		logging.warning(f"Quantization Toolkit Save: failed to inspect saved checkpoint ({e}).")
 
 
 class INT8ModelSave:
@@ -276,7 +345,7 @@ class INT8ModelSave:
 		return {
 			"required": {
 				"model": ("MODEL",),
-				"filename_prefix": ("STRING", {"default": "int8_models/INT8_Model"}),
+				"filename_prefix": ("STRING", {"default": "quantized_models/Quantized_Model"}),
 			},
 			"hidden": {
 				"prompt": "PROMPT",
@@ -288,9 +357,11 @@ class INT8ModelSave:
 	FUNCTION = "save"
 	OUTPUT_NODE = True
 	CATEGORY = "loaders"
-	DESCRIPTION = "Save MODEL outputs that include INT8-patched layers with a DynamicVRAM-safe save path."
+	DESCRIPTION = "Save MODEL outputs that include Toolkit INT8 or native ConvRot INT4 layers with a DynamicVRAM-safe save path."
 
 	def save(self, model, filename_prefix, prompt=None, extra_pnginfo=None):
+		_validate_quantized_model(model)
+
 		full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(
 			filename_prefix,
 			self.output_dir,
@@ -319,16 +390,16 @@ class INT8ModelSave:
 
 		applied_object_patches = _apply_object_patches_for_save(model)
 		if applied_object_patches:
-			print("[INT8 Model Save] Applied object patches before saving INT8 modules.")
+			logging.info("Quantization Toolkit save: applied object patches before saving quantized modules.")
 
 		modules_to_patch = _collect_modules_for_save_workaround(model)
 		if not modules_to_patch:
-			logging.warning("INT8 Model Save: no target modules were found for DynamicVRAM save workaround.")
+			logging.warning("Quantization Toolkit Save: no target modules were found for the DynamicVRAM save workaround.")
 		else:
-			print(f"[INT8 Model Save] Applying DynamicVRAM save workaround on {len(modules_to_patch)} module(s).")
+			logging.info(f"Quantization Toolkit save: applying the Dynamic VRAM workaround to {len(modules_to_patch)} module(s).")
 		with _temporary_save_compatibility_shim(modules_to_patch):
 			comfy.sd.save_checkpoint(output_checkpoint, model, metadata=metadata)
 
-		_summarize_saved_int8_checkpoint(output_checkpoint)
+		_summarize_saved_quantized_checkpoint(output_checkpoint)
 
 		return {}

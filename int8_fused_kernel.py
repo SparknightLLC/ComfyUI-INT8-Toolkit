@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import torch
@@ -6,9 +7,6 @@ import torch
 # Runtime Kernel Configuration
 # =============================================================================
 
-LOG_PREFIX = "[ComfyUI-INT8-Toolkit]"
-
-
 def _read_env_int(name: str, default_value: int) -> int:
 	raw_value = os.environ.get(name)
 	if raw_value is None:
@@ -16,7 +14,7 @@ def _read_env_int(name: str, default_value: int) -> int:
 	try:
 		return int(raw_value)
 	except ValueError:
-		print(f"{LOG_PREFIX} Invalid {name}={raw_value!r}; using {default_value}.")
+		logging.warning(f"Quantization Toolkit INT8: invalid {name}={raw_value!r}; using {default_value}.")
 		return default_value
 
 
@@ -77,10 +75,10 @@ def set_fixed_kernel_config(config: dict, source: str = "runtime", silent: bool 
 				merged[key] = config[key]
 		_FIXED_KERNEL_CONFIG = _sanitize_kernel_config(merged)
 		if not silent:
-			print(f"{LOG_PREFIX} Applied INT8 Triton config from {source}: {_FIXED_KERNEL_CONFIG}")
+			logging.info(f"Quantization Toolkit INT8: applied Triton config from {source}: {_FIXED_KERNEL_CONFIG}")
 	except Exception as e:
 		if not silent:
-			print(f"{LOG_PREFIX} Failed to apply kernel config from {source}: {e}")
+			logging.warning(f"Quantization Toolkit INT8: failed to apply Triton config from {source} ({e}).")
 	return dict(_FIXED_KERNEL_CONFIG)
 
 
@@ -201,10 +199,10 @@ def microbench_fixed_kernel_configs(
 	return best, results
 
 if _ENABLE_TRITON_AUTOTUNE:
-	print(f"{LOG_PREFIX} Triton autotune is enabled (INT8_TRITON_AUTOTUNE=1).")
+	logging.info("Quantization Toolkit INT8: Triton autotune is enabled (INT8_TRITON_AUTOTUNE=1).")
 else:
-	print(
-		f"{LOG_PREFIX} Triton autotune is disabled; using fixed INT8 kernel config "
+	logging.info(
+		"Quantization Toolkit INT8: Triton autotune is disabled; using fixed kernel config "
 		f"{_FIXED_KERNEL_CONFIG}."
 	)
 

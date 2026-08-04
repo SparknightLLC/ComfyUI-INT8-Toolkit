@@ -74,7 +74,7 @@ class INT8KernelConfigTuner:
 	RETURN_TYPES = ("MODEL",)
 	FUNCTION = "apply_kernel_config"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Apply INT8 Triton kernel config. Optionally run an on-demand microbench and print recommended env vars."
+	DESCRIPTION = "Apply INT8 Triton kernel config. Optionally run an on-demand microbench and log recommended env vars."
 
 	def apply_kernel_config(
 		self,
@@ -116,8 +116,8 @@ class INT8KernelConfigTuner:
 		selected_config = manual_config
 		if run_microbench:
 			try:
-				print(
-					f"[ComfyUI-INT8-Toolkit] Running kernel microbench "
+				logging.info(
+					f"Quantization Toolkit INT8: running kernel microbench "
 					f"(M={bench_m}, K={bench_k}, N={bench_n}, warmup={bench_warmup}, iters={bench_iterations})..."
 				)
 				best_config, results = int8_fused_kernel.microbench_fixed_kernel_configs(
@@ -130,9 +130,9 @@ class INT8KernelConfigTuner:
 					extra_candidates=[manual_config],
 				)
 				selected_config = best_config
-				print("[ComfyUI-INT8-Toolkit] Microbench results (top 3):")
+				logging.info("Quantization Toolkit INT8: microbench results (top 3):")
 				for row in results[:3]:
-					print(f"  avg_ms={row['avg_ms']:.3f} config={row['config']}")
+					logging.info(f"Quantization Toolkit INT8: avg_ms={row['avg_ms']:.3f} config={row['config']}")
 			except Exception as e:
 				logging.warning(f"INT8 Kernel Config: microbench failed ({e}); using manual config.")
 
@@ -151,9 +151,9 @@ class INT8KernelConfigTuner:
 
 		_ensure_kernel_config_wrapper(model_patcher)
 
-		print("[ComfyUI-INT8-Toolkit] Recommended environment variables for persistent config:")
+		logging.info("Quantization Toolkit INT8: recommended environment variables for persistent config:")
 		for line in int8_fused_kernel.format_kernel_config_env_lines(applied_config):
-			print(f"  {line}")
+			logging.info(f"Quantization Toolkit INT8: {line}")
 
 		return (model_patcher,)
 

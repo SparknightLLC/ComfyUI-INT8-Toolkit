@@ -10,6 +10,8 @@ from .int8_lora_patching import (
     _LORA_ADAPTER_AVAILABLE,
     _append_lora_signature,
     _get_key_map,
+    _get_supported_quantization_format,
+    _resolve_target_module_cached,
     _wrap_static_int8_patches,
 )
 
@@ -27,6 +29,32 @@ def _is_dynamic_compatible_adapter(adapter):
     dora_scale = weights[4] if len(weights) > 4 else None
     reshape = weights[5] if len(weights) > 5 else None
     return dora_scale is None and reshape is None
+
+
+def _partition_dynamic_patches(model_patcher, patch_dict, module_cache):
+    dynamic_patch_dict = {}
+    static_patch_dict = {}
+
+    for key, adapter in patch_dict.items():
+        if not _is_dynamic_compatible_adapter(adapter):
+            static_patch_dict[key] = adapter
+            continue
+
+        try:
+            target_module = _resolve_target_module_cached(model_patcher, key, module_cache)
+            quantization_format = _get_supported_quantization_format(target_module)
+        except Exception:
+            quantization_format = None
+
+        if quantization_format is not None:
+            dynamic_patch_dict[key] = adapter
+        else:
+            # Dynamic runtime hooks intentionally cover Toolkit-supported INT8
+            # and W4A4 modules only. Preserve LoRA coverage on floating-point and
+            # other mixed-precision layers through ComfyUI's ordinary patch path.
+            static_patch_dict[key] = adapter
+
+    return dynamic_patch_dict, static_patch_dict
 
 
 def _dynamic_lora_sync_wrapper(executor, *args, **kwargs):
@@ -82,13 +110,11 @@ class INT8DynamicLoraLoader:
         patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
         del lora
 
-        dynamic_patch_dict = {}
-        static_patch_dict = {}
-        for key, adapter in patch_dict.items():
-            if _is_dynamic_compatible_adapter(adapter):
-                dynamic_patch_dict[key] = adapter
-            else:
-                static_patch_dict[key] = adapter
+        dynamic_patch_dict, static_patch_dict = _partition_dynamic_patches(
+            model_patcher,
+            patch_dict,
+            module_cache={},
+        )
         del patch_dict
 
         # 2. Register Global Hook (if not exists)
@@ -153,6 +179,10 @@ class INT8DynamicLoraStack:
             if lora_name and lora_name != "None" and strength != 0:
                 lora_entries.append((lora_name, strength))
 
+        return self.apply_loras(model, lora_entries)
+
+    def apply_loras(self, model, lora_entries):
+
         if not lora_entries:
             return (model,)
 
@@ -173,6 +203,8 @@ class INT8DynamicLoraStack:
         existing_loras = opts.get("dynamic_loras", [])
         opts["dynamic_loras"] = existing_loras.copy()
         module_cache = {}
+        dynamic_patch_count = 0
+        static_patch_count = 0
 
         for lora_name, strength in lora_entries:
             lora_path = folder_paths.get_full_path("loras", lora_name)
@@ -180,14 +212,14 @@ class INT8DynamicLoraStack:
             patch_dict = comfy.lora.load_lora(lora_data, key_map, log_missing=True)
             del lora_data
 
-            dynamic_patch_dict = {}
-            static_patch_dict = {}
-            for key, adapter in patch_dict.items():
-                if _is_dynamic_compatible_adapter(adapter):
-                    dynamic_patch_dict[key] = adapter
-                else:
-                    static_patch_dict[key] = adapter
+            dynamic_patch_dict, static_patch_dict = _partition_dynamic_patches(
+                model_patcher,
+                patch_dict,
+                module_cache,
+            )
             del patch_dict
+            dynamic_patch_count += len(dynamic_patch_dict)
+            static_patch_count += len(static_patch_dict)
 
             if dynamic_patch_dict:
                 opts["dynamic_loras"].append({
@@ -207,7 +239,10 @@ class INT8DynamicLoraStack:
 
             _append_lora_signature(model_patcher, "Dynamic", lora_name, strength)
 
-        logging.info(f"INT8 Dynamic LoRA Stack: Loaded {len(lora_entries)} LoRAs in a single pass.")
+        logging.info(
+            f"Quantization Toolkit LoRA stack (Dynamic): loaded {len(lora_entries)} LoRAs in a single pass "
+            f"(runtime patch targets={dynamic_patch_count}, standard fallback targets={static_patch_count})."
+        )
         return (model_patcher,)
 
 NODE_CLASS_MAPPINGS = {
@@ -216,6 +251,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "INT8DynamicLoraLoader": "Load LoRA INT8 (Dynamic)",
-    "INT8DynamicLoraStack": "INT8 LoRA Stack (Dynamic)",
+    "INT8DynamicLoraLoader": "Load LoRA (Quantized, Dynamic)",
+    "INT8DynamicLoraStack": "Load LoRA Stack (Quantized, Dynamic)",
 }

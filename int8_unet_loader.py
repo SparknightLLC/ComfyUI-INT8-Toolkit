@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import folder_paths
 
@@ -7,11 +9,18 @@ from .int8_quant import (
     DEFAULT_INT8_BACKEND,
     INT8_BACKEND_TRITON,
     INT8_BACKEND_TRITON_LEGACY_UNSAFE,
-    OUTLIER_METHOD_CHOICES,
-    OUTLIER_METHOD_NONE,
+    QUANTIZATION_MODE_CHOICES,
+    QUANTIZATION_MODE_INT8,
+    QUANTIZATION_MODE_INT4_MIXED,
+    normalize_quantization_mode,
+    quantization_mode_outlier_method,
+    quantization_mode_is_int4,
+    native_int4_available,
     SMALL_BATCH_FALLBACK_CHOICES,
     DEFAULT_SMALL_BATCH_FALLBACK,
 )
+from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
+from .quantization_policy import normalize_int4_mixed_ratio
 
 
 MODEL_TYPE_FLUX2 = "flux2"
@@ -36,10 +45,10 @@ MODEL_TYPE_CHOICES = [
     "wan",
     "z-image",
 ]
-DEFAULT_OUTLIER_METHOD = OUTLIER_METHOD_NONE
+DEFAULT_QUANTIZATION_MODE = QUANTIZATION_MODE_INT8
 
 
-def get_model_type_exclusions(model_type):
+def _get_model_type_keep_float(model_type):
     if model_type == MODEL_TYPE_FLUX2:
         return [
             "img_in", "time_in", "guidance_in", "txt_in", "final_layer",
@@ -73,7 +82,7 @@ def get_model_type_exclusions(model_type):
         ]
     if model_type == "anima":
         return [
-            "embed", "llm", "adaln",
+            "embed", "llm", "adaln", "final_layer",
         ]
     if model_type == MODEL_TYPE_BOOGU:
         return [
@@ -109,6 +118,25 @@ def get_model_type_exclusions(model_type):
             "av_ca_video_scale_shift_adaln_single", "caption_projection", "patchify_proj", "proj_out", "scale_shift_table",
         ]
     return []
+
+
+def _get_model_type_int4_sensitive(model_type):
+    if model_type == "anima":
+        return [
+            "self_attn.output_proj", "cross_attn.output_proj", "mlp.layer2",
+        ]
+    if model_type == MODEL_TYPE_KREA2:
+        return [
+            "attn.wo", "mlp.down",
+        ]
+    return []
+
+
+def get_model_type_quantization_preset(model_type):
+    return {
+        "keep_float": tuple(_get_model_type_keep_float(model_type)),
+        "int4_sensitive": tuple(_get_model_type_int4_sensitive(model_type)),
+    }
 
 
 def _read_safetensors_metadata(path):
@@ -157,19 +185,20 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "Diffusion model checkpoint to load from ComfyUI's diffusion_models folder."}),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"], {"tooltip": "Requested source weight dtype passed to ComfyUI during model construction. INT8 checkpoints still load as INT8 when weight_scale tensors are present."}),
-                "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. flux2_fast_unsafe is opt-in and less conservative."}),
-                "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights to INT8 during loading. Leave off for already-quantized INT8 checkpoints."}),
-                "outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply during on-the-fly INT8 quantization. ConvRot uses regular Hadamard rotation and can export native Comfy metadata. QuaRot uses this toolkit's legacy Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
+                "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. flux2_fast_unsafe is opt-in and less conservative."}),
+                "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights using the selected mode during loading. Leave off for checkpoints that already contain native quantization metadata."}),
+                "quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. Both INT4 modes preserve keep-float layers. int4_mixed keeps a configurable fraction of compatible linears in ConvRot INT8; int4_full uses W4A4 whenever shapes permit."}),
+                "int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
                 "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
-                "runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
-                "prepack_int8_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental: keep an extra transposed INT8 weight buffer for Triton so output columns are read contiguously. May improve speed but adds roughly one extra INT8 copy of each quantized weight."}),
+                "runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
+                "prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "loaders"
-    DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
+    DESCRIPTION = "Load native mixed INT4/INT8 checkpoints or quantize float and FP8 diffusion models on the fly."
 
     def load_unet(
         self,
@@ -177,10 +206,11 @@ class UNetLoaderINTW8A8:
         weight_dtype,
         model_type,
         on_the_fly_quantization,
-        outlier_method=DEFAULT_OUTLIER_METHOD,
+        quantization_mode=DEFAULT_QUANTIZATION_MODE,
+        int4_mixed_ratio=DEFAULT_INT4_MIXED_RATIO,
         small_batch_fallback=DEFAULT_SMALL_BATCH_FALLBACK,
         runtime_backend=DEFAULT_INT8_BACKEND,
-        prepack_int8_weights=False,
+        prepack_weights=False,
     ):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
@@ -200,22 +230,29 @@ class UNetLoaderINTW8A8:
         # Set quantization flags for this load
         if runtime_backend not in INT8_BACKEND_CHOICES:
             runtime_backend = DEFAULT_INT8_BACKEND
-        Int8TensorwiseOps.excluded_names = []
+        Int8TensorwiseOps.keep_float_names = []
+        Int8TensorwiseOps.int4_sensitive_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
-        Int8TensorwiseOps.outlier_method = outlier_method if on_the_fly_quantization else DEFAULT_OUTLIER_METHOD
+        quantization_mode = normalize_quantization_mode(quantization_mode)
+        if on_the_fly_quantization and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+            raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
+        Int8TensorwiseOps.quantization_mode = quantization_mode if on_the_fly_quantization else QUANTIZATION_MODE_INT8
+        Int8TensorwiseOps.int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)
+        Int8TensorwiseOps.outlier_method = quantization_mode_outlier_method(Int8TensorwiseOps.quantization_mode)
         Int8TensorwiseOps.use_triton = True
         Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
         Int8TensorwiseOps.runtime_backend = runtime_backend
         Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
         Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
-        Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
+        Int8TensorwiseOps.prepack_int8_weights = bool(prepack_weights)
         Int8TensorwiseOps._is_prequantized = False
         Int8TensorwiseOps.reset_otf_progress()
         
-        # Check explicit model_type for exclusions
-        Int8TensorwiseOps.excluded_names = get_model_type_exclusions(model_type)
+        quantization_preset = get_model_type_quantization_preset(model_type)
+        Int8TensorwiseOps.keep_float_names = list(quantization_preset["keep_float"])
+        Int8TensorwiseOps.int4_sensitive_names = list(quantization_preset["int4_sensitive"])
         if on_the_fly_quantization and model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE:
-            print("[INT8 Loader] flux2_fast_unsafe selected; using the less conservative Flux2 exclusion preset.")
+            logging.info("Quantization Toolkit loader: flux2_fast_unsafe selected; using the less conservative Flux2 keep-float preset.")
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)

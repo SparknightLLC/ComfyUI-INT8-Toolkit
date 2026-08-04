@@ -1,11 +1,11 @@
 """
-INT8 Toolkit - INT8 Tensorwise Quantization for ComfyUI
+ComfyUI Quantization Toolkit - native INT4 and Toolkit INT8 support
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
-- OTUNetLoaderW8A8: Load int8 quantized diffusion models
+- OTUNetLoaderW8A8: Backward-compatible loader ID for mixed INT4/INT8 diffusion models
 - INT8LoraLoader / INT8LoraLoaderStack: Unified LoRA loaders with mode switching
-- INT8ModelAdapter: Enable INT8 on an existing MODEL
+- INT8ModelAdapter: Backward-compatible adapter ID for quantizing an existing MODEL
 
 Uses torch._int_mm for fast inference.
 """
@@ -63,9 +63,9 @@ def _register_layouts():
         )
         
     except ImportError:
-        logging.warning("INT8 Toolkit: ComfyUI Quantization system not found (Update ComfyUI?)")
+        logging.warning("Quantization Toolkit: ComfyUI quantization support was not found; update ComfyUI.")
     except Exception as e:
-        logging.error(f"INT8 Toolkit: Failed to register layouts: {e}")
+        logging.error(f"Quantization Toolkit: failed to register quantization layouts ({e}).")
 
 
 # =============================================================================
@@ -85,7 +85,7 @@ except ImportError:
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
-    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
+    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack, QuantizedLoraConfig, QuantizedLoraPatcher
     from .int8_kernel_config_node import INT8KernelConfigTuner
     from .int8_model_adapter import INT8ModelAdapter
     from .int8_model_save import INT8ModelSave
@@ -98,20 +98,24 @@ try:
         "INT8LazyTorchCompile": INT8LazyTorchCompile,
         "INT8LoraLoader": INT8LoraLoader,
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
+        "QuantizedLoraConfig": QuantizedLoraConfig,
+        "QuantizedLoraPatcher": QuantizedLoraPatcher,
         "INT8KernelConfigTuner": INT8KernelConfigTuner,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
-        "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
-        "INT8ModelAdapter": "Enable INT8 on MODEL",
-        "INT8ModelSave": "Save Model INT8 (DynamicVRAM Safe)",
-        "INT8LazyTorchCompile": "INT8 Lazy Torch Compile",
-        "INT8LoraLoader": "Load LoRA INT8",
-        "INT8LoraLoaderStack": "Load LoRA Stack INT8",
+        "OTUNetLoaderW8A8": "Load Diffusion Model Quantized",
+        "INT8ModelAdapter": "Enable Quantization on MODEL",
+        "INT8ModelSave": "Save Quantized Model (DynamicVRAM Safe)",
+        "INT8LazyTorchCompile": "Quantized Lazy Torch Compile",
+        "INT8LoraLoader": "Load LoRA (Quantized)",
+        "INT8LoraLoaderStack": "Load LoRA Stack (Quantized)",
+        "QuantizedLoraConfig": "LoRA Stack Entry (Quantized)",
+        "QuantizedLoraPatcher": "Apply LoRA Stack (Quantized)",
         "INT8KernelConfigTuner": "INT8 Kernel Config",
     }
 except ImportError as e:
-    logging.error(f"INT8 Toolkit: Failed to import nodes: {e}")
+    logging.error(f"Quantization Toolkit: failed to import nodes ({e}).")
     NODE_CLASS_MAPPINGS = {}
     NODE_DISPLAY_NAME_MAPPINGS = {}
 
