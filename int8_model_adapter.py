@@ -47,6 +47,7 @@ from .int8_unet_loader import MODEL_TYPE_FLUX2_FAST_UNSAFE
 from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
 from .int8_unet_loader import MODEL_TYPE_IDEOGRAM4
 from .int8_unet_loader import MODEL_TYPE_KREA2
+from .int8_unet_loader import MODEL_TYPE_MINIMAX_H3
 from .int8_unet_loader import DEFAULT_QUANTIZATION_MODE
 from .int8_unet_loader import get_model_type_quantization_preset
 from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
@@ -123,6 +124,13 @@ MODEL_TYPE_FINGERPRINTS = {
 		"txtfusion",
 		"txtmlp",
 	),
+	MODEL_TYPE_MINIMAX_H3: (
+		"video_patch_proj",
+		"audio_patch_proj",
+		"condition_proj",
+		"token_refiner",
+		"adaln_proj",
+	),
 	"z-image": (
 		"cap_embedder",
 		"context_refiner",
@@ -183,6 +191,7 @@ MODEL_TYPE_REQUIRED_MARKERS = {
 	MODEL_TYPE_HIDREAM_O1: ("language_model.layers",),
 	MODEL_TYPE_IDEOGRAM4: ("embed_image_indicator", "t_embedding"),
 	MODEL_TYPE_KREA2: ("txtfusion", "tmlp", "tproj"),
+	MODEL_TYPE_MINIMAX_H3: ("video_patch_proj", "audio_patch_proj", "token_refiner"),
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),

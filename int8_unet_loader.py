@@ -29,6 +29,7 @@ MODEL_TYPE_BOOGU = "boogu"
 MODEL_TYPE_HIDREAM_O1 = "hidream o1"
 MODEL_TYPE_IDEOGRAM4 = "ideogram4"
 MODEL_TYPE_KREA2 = "krea2"
+MODEL_TYPE_MINIMAX_H3 = "minimax_h3"
 MODEL_TYPE_CHOICES = [
     "anima",
     MODEL_TYPE_BOOGU,
@@ -39,6 +40,7 @@ MODEL_TYPE_CHOICES = [
     MODEL_TYPE_HIDREAM_O1,
     MODEL_TYPE_IDEOGRAM4,
     MODEL_TYPE_KREA2,
+    MODEL_TYPE_MINIMAX_H3,
     "ltx2",
     "qwen",
     "sdxl",
@@ -100,6 +102,11 @@ def _get_model_type_keep_float(model_type):
         return [
             "first", "last", "tmlp", "tproj", "txtfusion", "txtmlp",
         ]
+    if model_type == MODEL_TYPE_MINIMAX_H3:
+        return [
+            "video_patch_proj", "audio_patch_proj", "condition_proj", "time_embedder",
+            "token_refiner", "adaln_proj", "final_layer",
+        ]
     if model_type == "sdxl":
         return [
             "time_embed", "label_emb", "emb_layers", "proj_in", "proj_out",
@@ -128,6 +135,10 @@ def _get_model_type_int4_sensitive(model_type):
     if model_type == MODEL_TYPE_KREA2:
         return [
             "attn.wo", "mlp.down",
+        ]
+    if model_type == MODEL_TYPE_MINIMAX_H3:
+        return [
+            "attn.out_proj", "mlp.fc2",
         ]
     return []
 

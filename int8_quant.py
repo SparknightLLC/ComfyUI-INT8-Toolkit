@@ -313,6 +313,22 @@ def _build_outlier_hadamard(method, group_size: int, device=None, dtype=torch.fl
         return None
     return _quarot_build_hadamard(group_size, device=device, dtype=dtype)
 
+def _validate_convrot_group_size(group_size, in_features: int, context: str) -> int:
+    try:
+        group_size = int(group_size)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{context}: invalid ConvRot group size {group_size!r}") from e
+
+    if group_size <= 0:
+        raise ValueError(f"{context}: ConvRot group size must be positive, got {group_size}")
+    if group_size < 4 or (group_size & (group_size - 1)) != 0 or ((group_size.bit_length() - 1) % 2) != 0:
+        raise ValueError(f"{context}: ConvRot group size must be a power of 4, got {group_size}")
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"{context}: in_features {in_features} is not divisible by ConvRot group size {group_size}"
+        )
+    return group_size
+
 def _rotate_weight_for_outlier_method(weight: Tensor, h_matrix: Tensor, group_size: int, method) -> Tensor:
     normalized = _normalize_outlier_method(method)
     if normalized == OUTLIER_METHOD_CONVROT:
@@ -2128,7 +2144,11 @@ if _COMFY_OPS_AVAILABLE:
                         self.hadanorm_sigma = None
                         self.weight_packed = None
                         self.weight_int_mm = None
-                        self._convrot_groupsize = int(native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
+                        self._convrot_groupsize = _validate_convrot_group_size(
+                            native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE),
+                            self.in_features,
+                            f"Quantized layer {prefix.rstrip('.') or '<root>'}",
+                        )
                         self._quant_group_size = _INT4_QUANT_GROUP_SIZE
                         self._linear_dtype = str(native_quant_config.get("linear_dtype", "int4"))
                         orig_dtype = getattr(self, "weight_comfy_model_dtype", None) or torch.bfloat16
@@ -2186,7 +2206,11 @@ if _COMFY_OPS_AVAILABLE:
                             and native_quant_config.get("format") == "int8_tensorwise"
                             and native_quant_config.get("convrot", False)
                         ):
-                            convrot_group_size = int(native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
+                            convrot_group_size = _validate_convrot_group_size(
+                                native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE),
+                                self.in_features,
+                                f"Quantized layer {prefix.rstrip('.') or '<root>'}",
+                            )
                             try:
                                 h_matrix = _build_outlier_hadamard(
                                     OUTLIER_METHOD_CONVROT,
@@ -2194,11 +2218,15 @@ if _COMFY_OPS_AVAILABLE:
                                     device="cpu",
                                     dtype=torch.float32,
                                 )
-                                if h_matrix is not None:
-                                    self.quarot_hadamard = h_matrix
-                                    self._outlier_method = OUTLIER_METHOD_CONVROT
+                                if h_matrix is None:
+                                    raise RuntimeError("ConvRot Hadamard helper is unavailable")
+                                self._convrot_groupsize = convrot_group_size
+                                self.quarot_hadamard = h_matrix
+                                self._outlier_method = OUTLIER_METHOD_CONVROT
                             except Exception as e:
-                                logging.warning(f"Quantization Toolkit: ConvRot metadata ignored for {prefix} ({e}).")
+                                raise ValueError(
+                                    f"Quantized layer {prefix.rstrip('.') or '<root>'}: invalid ConvRot metadata ({e})"
+                                ) from e
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight_tensor.dtype):
                         # Load High-Precision
@@ -2379,11 +2407,16 @@ if _COMFY_OPS_AVAILABLE:
 
                 if self._quant_format == "convrot_w4a4" and _is_native_int4_tensor(self.weight):
                     params = self.weight._params
+                    convrot_group_size = _validate_convrot_group_size(
+                        params.convrot_groupsize,
+                        self.in_features,
+                        f"Quantized layer {prefix.rstrip('.') or '<root>'}",
+                    )
                     output[prefix + "weight"] = self.weight._qdata if keep_vars else self.weight._qdata.detach()
                     output[prefix + "weight_scale"] = params.scale if keep_vars else params.scale.detach()
                     quant_config = {
                         "format": "convrot_w4a4",
-                        "convrot_groupsize": int(params.convrot_groupsize),
+                        "convrot_groupsize": convrot_group_size,
                     }
                     if params.linear_dtype != "int4":
                         quant_config["linear_dtype"] = params.linear_dtype
@@ -2397,7 +2430,16 @@ if _COMFY_OPS_AVAILABLE:
                 quant_config = {"format": "int8_tensorwise"}
                 if outlier_method == OUTLIER_METHOD_CONVROT:
                     hadamard = getattr(self, "quarot_hadamard", None)
-                    convrot_group_size = int(hadamard.shape[-1]) if isinstance(hadamard, torch.Tensor) else _CONVROT_GROUP_SIZE
+                    convrot_group_size = _validate_convrot_group_size(
+                        self._convrot_groupsize,
+                        self.in_features,
+                        f"Quantized layer {prefix.rstrip('.') or '<root>'}",
+                    )
+                    if not isinstance(hadamard, torch.Tensor) or tuple(hadamard.shape) != (convrot_group_size, convrot_group_size):
+                        raise ValueError(
+                            f"Quantized layer {prefix.rstrip('.') or '<root>'}: ConvRot Hadamard shape must be "
+                            f"({convrot_group_size}, {convrot_group_size})"
+                        )
                     quant_config["convrot"] = True
                     quant_config["convrot_groupsize"] = convrot_group_size
                     output.pop(prefix + "quarot_hadamard", None)

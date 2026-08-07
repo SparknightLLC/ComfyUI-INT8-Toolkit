@@ -2,7 +2,7 @@
 [project]
 name = "comfyui-int8-fast-fork" # Immutable Comfy Registry ID; repository/display names may differ.
 description = "Quantization toolkit for ComfyUI with native INT4/INT8 conversion, mixed-precision loading, LoRA handling, and low-VRAM runtime controls."
-version = "2.0.0"
+version = "2.1.0"
 license = { file = "LICENSE" }
 dependencies = []
 keywords = ["comfyui", "quantization", "int4", "int8", "w4a4", "w8a8"]

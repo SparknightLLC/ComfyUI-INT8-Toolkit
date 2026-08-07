@@ -87,6 +87,100 @@ class QuantizationModeTests(unittest.TestCase):
 		).to(base_output.dtype)
 		torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
+	def test_native_int8_convrot_metadata_round_trip_preserves_layer_group_size(self):
+		state_dict = {
+			"weight": torch.randint(-8, 9, (16, 2688), dtype=torch.int8),
+			"weight_scale": torch.ones((16, 1), dtype=torch.float32),
+			"comfy_quant": quant._encode_comfy_quant_config({
+				"format": "int8_tensorwise",
+				"convrot": True,
+				"convrot_groupsize": 64,
+			}),
+		}
+		module = quant.Int8TensorwiseOps.Linear(2688, 16, bias=False, device="cpu", dtype=torch.float32)
+
+		module.load_state_dict(state_dict, strict=False)
+
+		self.assertEqual(module._convrot_groupsize, 64)
+		self.assertEqual(tuple(module.quarot_hadamard.shape), (64, 64))
+		self.assertEqual(module._outlier_method, quant.OUTLIER_METHOD_CONVROT)
+		with mock.patch.object(
+			quant,
+			"_native_int8_convrot_linear",
+			return_value=torch.zeros((2, 16), dtype=torch.bfloat16),
+		) as native_linear:
+			module(torch.randn(2, 2688, dtype=torch.float32))
+		native_linear.assert_called_once()
+		self.assertEqual(native_linear.call_args.args[-1], 64)
+
+		saved_state_dict = module.state_dict()
+		saved_config = quant._decode_comfy_quant_config(saved_state_dict["comfy_quant"])
+		self.assertEqual(saved_config["convrot_groupsize"], 64)
+		self.assertNotIn("quarot_hadamard", saved_state_dict)
+
+		reloaded = quant.Int8TensorwiseOps.Linear(2688, 16, bias=False, device="cpu", dtype=torch.float32)
+		reloaded.load_state_dict(saved_state_dict, strict=False)
+		self.assertEqual(reloaded._convrot_groupsize, 64)
+		self.assertEqual(tuple(reloaded.quarot_hadamard.shape), (64, 64))
+
+	def test_native_int8_convrot_load_rejects_invalid_group_metadata(self):
+		for group_size, message in (
+			(0, "must be positive"),
+			(256, "2688 is not divisible"),
+			(32, "must be a power of 4"),
+			("invalid", "invalid ConvRot group size"),
+		):
+			with self.subTest(group_size=group_size):
+				module = quant.Int8TensorwiseOps.Linear(2688, 16, bias=False, device="cpu", dtype=torch.float32)
+				state_dict = {
+					"weight": torch.randint(-8, 9, (16, 2688), dtype=torch.int8),
+					"weight_scale": torch.ones((16, 1), dtype=torch.float32),
+					"comfy_quant": quant._encode_comfy_quant_config({
+						"format": "int8_tensorwise",
+						"convrot": True,
+						"convrot_groupsize": group_size,
+					}),
+				}
+
+				with self.assertRaisesRegex(ValueError, message):
+					module.load_state_dict(state_dict, strict=False)
+
+	def test_native_int8_convrot_save_rejects_inconsistent_hadamard_shape(self):
+		module = quant.Int8TensorwiseOps.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+		module.weight = nn.Parameter(torch.randint(-8, 9, (16, 256), dtype=torch.int8), requires_grad=False)
+		module.weight_scale = torch.ones((16, 1), dtype=torch.float32)
+		module._is_quantized = True
+		module._quant_format = "int8_tensorwise"
+		module._outlier_method = quant.OUTLIER_METHOD_CONVROT
+		module._convrot_groupsize = 256
+		module.quarot_hadamard = quant._build_outlier_hadamard(
+			quant.OUTLIER_METHOD_CONVROT,
+			64,
+			device="cpu",
+			dtype=torch.float32,
+		)
+
+		with self.assertRaisesRegex(ValueError, "Hadamard shape must be"):
+			module.state_dict()
+
+	def test_native_int8_convrot_save_rejects_nondivisible_group_size(self):
+		module = quant.Int8TensorwiseOps.Linear(2688, 16, bias=False, device="cpu", dtype=torch.float32)
+		module.weight = nn.Parameter(torch.randint(-8, 9, (16, 2688), dtype=torch.int8), requires_grad=False)
+		module.weight_scale = torch.ones((16, 1), dtype=torch.float32)
+		module._is_quantized = True
+		module._quant_format = "int8_tensorwise"
+		module._outlier_method = quant.OUTLIER_METHOD_CONVROT
+		module._convrot_groupsize = 256
+		module.quarot_hadamard = quant._build_outlier_hadamard(
+			quant.OUTLIER_METHOD_CONVROT,
+			256,
+			device="cpu",
+			dtype=torch.float32,
+		)
+
+		with self.assertRaisesRegex(ValueError, "2688 is not divisible"):
+			module.state_dict()
+
 	def test_dynamic_lora_hook_supports_baked_native_int8_linear(self):
 		class DiffusionModel(nn.Module):
 			def __init__(self):
@@ -396,6 +490,7 @@ class QuantizationModeTests(unittest.TestCase):
 	def test_architecture_presets_protect_residual_writeback_paths(self):
 		krea_preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_KREA2)
 		anima_preset = loader.get_model_type_quantization_preset("anima")
+		minimax_preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_MINIMAX_H3)
 
 		self.assertIn("first", krea_preset["keep_float"])
 		self.assertEqual(krea_preset["int4_sensitive"], ("attn.wo", "mlp.down"))
@@ -403,6 +498,30 @@ class QuantizationModeTests(unittest.TestCase):
 		self.assertEqual(
 			anima_preset["int4_sensitive"],
 			("self_attn.output_proj", "cross_attn.output_proj", "mlp.layer2"),
+		)
+		self.assertEqual(
+			minimax_preset["keep_float"],
+			(
+				"video_patch_proj", "audio_patch_proj", "condition_proj", "time_embedder",
+				"token_refiner", "adaln_proj", "final_layer",
+			),
+		)
+		self.assertEqual(minimax_preset["int4_sensitive"], ("attn.out_proj", "mlp.fc2"))
+
+	def test_model_adapter_auto_detects_minimax_h3(self):
+		class MiniMaxH3(nn.Module):
+			def __init__(self):
+				super().__init__()
+				self.video_patch_proj = nn.Linear(4, 4)
+				self.audio_patch_proj = nn.Linear(4, 4)
+				self.condition_proj = nn.Linear(4, 4)
+				self.token_refiner = nn.Sequential(nn.Linear(4, 4))
+				self.blocks = nn.ModuleList([nn.Module()])
+				self.blocks[0].adaln_proj = nn.Sequential(nn.Linear(4, 4))
+
+		self.assertEqual(
+			model_adapter._infer_model_type_from_modules(MiniMaxH3()),
+			loader.MODEL_TYPE_MINIMAX_H3,
 		)
 
 	def test_architecture_ratios_cover_residual_writeback_paths(self):
