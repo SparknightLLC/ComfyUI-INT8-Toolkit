@@ -1,6 +1,8 @@
 # Changelog
 
-<details open><summary>2.1.0</summary>
+All notable changes to this project will be documented in this file.
+
+<details open><summary>2.1.0 - 7 August 2026</summary>
 
 ### Added
 
@@ -14,7 +16,7 @@
 
 </details>
 
-<details><summary>2.0.0</summary>
+<details><summary>2.0.0 - 4 August 2026</summary>
 
 ### Added
 
@@ -67,9 +69,7 @@
 
 </details>
 
-All notable changes to this project will be documented in this file.
-
-<details open><summary>1.8.1 - 6 July 2026</summary>
+<details><summary>1.8.1 - 6 July 2026</summary>
 
 ### Fixed
 
