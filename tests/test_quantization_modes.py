@@ -326,6 +326,56 @@ class QuantizationModeTests(unittest.TestCase):
 			self.assertNotIn(mode, quant.QUANTIZATION_MODE_CHOICES)
 			self.assertEqual(quant.normalize_quantization_mode(mode), "int8")
 
+	def test_w4a8_is_exposed_as_a_distinct_low_bit_mode(self):
+		self.assertIn(quant.QUANTIZATION_MODE_W4A8, quant.QUANTIZATION_MODE_CHOICES)
+		self.assertTrue(quant.quantization_mode_is_int4(quant.QUANTIZATION_MODE_W4A8))
+		self.assertEqual(
+			quant.quantization_mode_outlier_method(quant.QUANTIZATION_MODE_W4A8),
+			quant.OUTLIER_METHOD_NONE,
+		)
+
+	def test_model_adapter_rejects_w4a8_without_native_layout(self):
+		with mock.patch.object(model_adapter, "native_w4a8_available", return_value=False):
+			with self.assertRaisesRegex(RuntimeError, "ComfyUI 0.31.0 or newer"):
+				model_adapter.INT8ModelAdapter().apply_quantization(
+					object(),
+					enable_quantization=model_adapter.QUANTIZATION_CONTROL_ALWAYS,
+					model_type=model_adapter.AUTO_MODEL_TYPE,
+					quantization_mode=quant.QUANTIZATION_MODE_W4A8,
+					log_progress=False,
+				)
+
+	@unittest.skipUnless(quant._NATIVE_W4A8_AVAILABLE, "Native ComfyUI W4A8 layout is unavailable")
+	def test_native_w4a8_state_dict_round_trip_and_requantization(self):
+		q_weight = quant.quantize_native_w4a8(torch.randn(16, 256, dtype=torch.float32))
+		module = quant.Int8TensorwiseOps.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+		module.weight = torch.nn.Parameter(q_weight, requires_grad=False)
+		module.weight_scale = None
+		module._is_quantized = True
+		module._quant_format = quant.W4A8_FORMAT
+		module._convrot_groupsize = q_weight._params.convrot_groupsize
+		module._w4a8_group_size = q_weight._params.group_size
+
+		state_dict = module.state_dict()
+		self.assertIn("weight_s_rel", state_dict)
+		self.assertIn("weight_s_channel", state_dict)
+		self.assertEqual(
+			quant._decode_comfy_quant_config(state_dict["comfy_quant"])["format"],
+			quant.W4A8_FORMAT,
+		)
+
+		loaded = quant.Int8TensorwiseOps.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+		loaded.load_state_dict(state_dict, strict=False)
+		self.assertEqual(loaded._quant_format, quant.W4A8_FORMAT)
+		self.assertEqual(loaded.weight._layout_cls, "AsymW4A8Int8Layout")
+
+		requantized = loaded.set_weight(
+			loaded.convert_weight(loaded.weight) + 0.01,
+			seed=17,
+			return_weight=True,
+		)
+		self.assertEqual(requantized._layout_cls, "AsymW4A8Int8Layout")
+
 	@unittest.skipUnless(quant._NATIVE_INT4_AVAILABLE, "Native ComfyUI INT4 layout is unavailable")
 	def test_native_int4_state_dict_round_trip(self):
 		weight = torch.randn(16, 256, dtype=torch.float32)
@@ -635,7 +685,7 @@ class QuantizationModeTests(unittest.TestCase):
 				model_adapter.QUANTIZATION_CONTROL_CHOICES,
 				{
 					"default": model_adapter.QUANTIZATION_CONTROL_AS_NEEDED,
-					"tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8 or W4A4 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged.",
+					"tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, or W4A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged.",
 				},
 			),
 		)
@@ -673,10 +723,13 @@ class QuantizationModeTests(unittest.TestCase):
 	def test_as_needed_recognizes_native_int8_but_not_fp8(self):
 		native_int8_module = nn.Linear(4, 4)
 		native_int8_module.quant_format = "int8_tensorwise"
+		native_w4a8_module = nn.Linear(4, 4)
+		native_w4a8_module.quant_format = "asym_w4a8_int8"
 		native_fp8_module = nn.Linear(4, 4)
 		native_fp8_module.quant_format = "float8_e4m3fn"
 
 		self.assertTrue(model_adapter._module_has_target_quantization(native_int8_module))
+		self.assertTrue(model_adapter._module_has_target_quantization(native_w4a8_module))
 		self.assertFalse(model_adapter._module_has_target_quantization(native_fp8_module))
 
 	def test_bypass_returns_model_without_inspection(self):

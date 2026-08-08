@@ -17,7 +17,9 @@ except Exception:
 
 
 INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
-SUPPORTED_QUANTIZATION_FORMATS = ("int8_tensorwise", "convrot_w4a4")
+W4A8_QUANTIZATION_FORMAT = "asym_w4a8_int8"
+SUPPORTED_QUANTIZATION_FORMATS = ("int8_tensorwise", "convrot_w4a4", W4A8_QUANTIZATION_FORMAT)
+NATIVE_REQUANTIZATION_FORMATS = ("convrot_w4a4", W4A8_QUANTIZATION_FORMAT)
 
 
 def _get_lora_signature(model_patcher):
@@ -284,6 +286,23 @@ def _model_has_int4_modules(model_patcher):
 	)
 
 
+def _model_has_w4a8_modules(model_patcher):
+	for object_patch_map_name in ("object_patches", "object_patches_backup"):
+		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
+		if isinstance(object_patch_map, dict):
+			for module in object_patch_map.values():
+				if _get_supported_quantization_format(module) == W4A8_QUANTIZATION_FORMAT:
+					return True
+
+	diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
+	if diffusion_model is None:
+		return False
+	return any(
+		_get_supported_quantization_format(module) == W4A8_QUANTIZATION_FORMAT
+		for module in diffusion_model.modules()
+	)
+
+
 def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, defer_unquantized=True):
 	final_patch_dict = {}
 	applied_count = 0
@@ -298,7 +317,7 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, 
 					applied_count += 1
 					if (
 						not _uses_toolkit_quantized_runtime(target_module)
-						or quantization_format == "convrot_w4a4"
+						or quantization_format in NATIVE_REQUANTIZATION_FORMATS
 					):
 						final_patch_dict[key] = adapter
 						continue
@@ -348,7 +367,7 @@ def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cac
 				continue
 			if (
 				not _uses_toolkit_quantized_runtime(target_module)
-				or quantization_format == "convrot_w4a4"
+				or quantization_format in NATIVE_REQUANTIZATION_FORMATS
 			):
 				wrapped_patch_dict[key] = adapter
 				continue

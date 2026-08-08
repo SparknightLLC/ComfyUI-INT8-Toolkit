@@ -11,8 +11,10 @@ from .int8_lora_patching import (
     _append_lora_signature,
     _get_key_map,
     _get_supported_quantization_format,
+    _model_has_w4a8_modules,
     _resolve_target_module_cached,
     _wrap_static_int8_patches,
+    W4A8_QUANTIZATION_FORMAT,
 )
 
 _DYNAMIC_LORA_WRAPPER_KEY = "int8_dynamic_lora_sync"
@@ -46,7 +48,9 @@ def _partition_dynamic_patches(model_patcher, patch_dict, module_cache):
         except Exception:
             quantization_format = None
 
-        if quantization_format is not None:
+        if quantization_format == W4A8_QUANTIZATION_FORMAT:
+            static_patch_dict[key] = adapter
+        elif quantization_format is not None:
             dynamic_patch_dict[key] = adapter
         else:
             # Dynamic runtime hooks intentionally cover Toolkit-supported INT8
@@ -55,6 +59,14 @@ def _partition_dynamic_patches(model_patcher, patch_dict, module_cache):
             static_patch_dict[key] = adapter
 
     return dynamic_patch_dict, static_patch_dict
+
+
+def _warn_if_w4a8_dynamic_fallback(model_patcher):
+    if _model_has_w4a8_modules(model_patcher):
+        logging.warning(
+            "Quantization Toolkit Dynamic LoRA: W4A8 runtime patching is not supported; "
+            "affected W4A8 layers will use ComfyUI's Standard LoRA patch path."
+        )
 
 
 def _dynamic_lora_sync_wrapper(executor, *args, **kwargs):
@@ -103,6 +115,7 @@ class INT8DynamicLoraLoader:
         lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
         model_patcher = model.clone()
+        _warn_if_w4a8_dynamic_fallback(model_patcher)
         
         # 1. Get Patch Map
         key_map = _get_key_map(model_patcher)
@@ -187,6 +200,7 @@ class INT8DynamicLoraStack:
             return (model,)
 
         model_patcher = model.clone()
+        _warn_if_w4a8_dynamic_fallback(model_patcher)
 
         key_map = _get_key_map(model_patcher)
 

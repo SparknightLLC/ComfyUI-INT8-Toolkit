@@ -47,6 +47,18 @@ class ModelSaveTests(unittest.TestCase):
 
 		model_save._validate_quantized_model(model_patcher)
 
+	def test_pending_w4a8_object_patch_is_accepted(self):
+		quantized_module = torch.nn.Linear(4, 4, bias=False)
+		quantized_module._is_quantized = True
+		quantized_module._quant_format = "asym_w4a8_int8"
+		model_patcher = SimpleNamespace(
+			model=torch.nn.Sequential(torch.nn.Linear(4, 4)),
+			object_patches={"diffusion_model.block.linear": quantized_module},
+			object_patches_backup={},
+		)
+
+		model_save._validate_quantized_model(model_patcher)
+
 	def test_dynamic_lora_is_rejected(self):
 		quantized_module = torch.nn.Linear(4, 4, bias=False)
 		quantized_module.weight = torch.nn.Parameter(

@@ -2,7 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.1.0 - 7 August 2026</summary>
+<details open><summary>2.2.0 - 8 August 2026</summary>
+
+### Added
+
+- Added experimental native `asym_w4a8_int8` checkpoint loading, on-the-fly conversion, MODEL adaptation, inference, and native metadata export through ComfyUI/comfy-kitchen's `AsymW4A8Int8Layout`.
+- Added W4A8 support to Stochastic LoRA patching through native dequantize, FP32 patch, and one-time requantization.
+- Added a temporary compiler-safe custom-op and FakeTensor boundary for W4A8 linear execution, allowing Quantized Lazy Torch Compile to optimize the surrounding transformer graph while the native kernel remains opaque.
+- Added preliminary RTX 3090/Krea2 W4A8 benchmarks covering warm throughput, reported model-weight footprint, and early visual observations.
+
+### Changed
+
+- Exposed `w4a8` as a distinct quantization mode. It retains architecture `keep_float` exclusions but does not use the layer-mixing `int4_mixed_ratio` or `int4_sensitive` policy.
+- Routed W4A8 targets in Dynamic LoRA mode through ComfyUI's Standard patch path and added an explicit console warning. INT8 and W4A4 targets retain runtime deltas.
+- Made W4A8 compile support capability-driven: the Toolkit shim is used while upstream lacks a compiler-safe operator, and registration failures return an eager MODEL with a detailed warning.
+
+### Fixed
+
+- Kept native low-bit tensor replacement format-specific so W4A4 and W4A8 tensors cannot be mistaken for one another during patch reconstruction.
+- Made `as_needed` ignore quantized modules temporarily installed on a shared model by another cached patcher, preventing format switches from returning an unowned stale quantization state and subsequently loading the full floating-point model. Toolkit object-patch cleanup now also survives extension hot reloads.
+
+### Removed
+
+- None.
+
+</details>
+
+<details><summary>2.1.0 - 7 August 2026</summary>
 
 ### Added
 

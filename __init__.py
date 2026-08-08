@@ -1,5 +1,5 @@
 """
-ComfyUI Quantization Toolkit - native INT4 and Toolkit INT8 support
+ComfyUI Quantization Toolkit - native W4A4/W4A8 and Toolkit W8A8 support
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading

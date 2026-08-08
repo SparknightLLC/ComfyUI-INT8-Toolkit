@@ -18,11 +18,15 @@ from .int8_quant import (
 	OUTLIER_METHOD_QUAROT,
 	QUANTIZATION_MODE_CHOICES,
 	QUANTIZATION_MODE_INT4_MIXED,
+	QUANTIZATION_MODE_W4A8,
+	W4A8_FORMAT,
 	normalize_quantization_mode,
 	quantization_mode_is_int4,
 	quantization_mode_outlier_method,
 	quantize_native_int4,
+	quantize_native_w4a8,
 	native_int4_available,
+	native_w4a8_available,
 	INT8_BACKEND_CHOICES,
 	DEFAULT_INT8_BACKEND,
 	INT8_BACKEND_TRITON,
@@ -383,24 +387,55 @@ def _module_has_target_quantization(module):
 	if getattr(module, "_is_quantized", False):
 		return True
 	return (
-		getattr(module, "_quant_format", None) in ("int8_tensorwise", "convrot_w4a4")
-		or getattr(module, "quant_format", None) in ("int8_tensorwise", "convrot_w4a4")
+		getattr(module, "_quant_format", None) in ("int8_tensorwise", "convrot_w4a4", W4A8_FORMAT)
+		or getattr(module, "quant_format", None) in ("int8_tensorwise", "convrot_w4a4", W4A8_FORMAT)
+	)
+
+
+def _module_is_toolkit_quantized(module):
+	return isinstance(module, Int8TensorwiseOps.Linear) or bool(getattr(module, "_is_quantized", False))
+
+
+def _module_path_is_shadowed(module_patch_key, object_patch_backup_keys):
+	return any(
+		module_patch_key == backup_key or module_patch_key.startswith(f"{backup_key}.")
+		for backup_key in object_patch_backup_keys
 	)
 
 
 def _model_has_quantized_modules(model_patcher):
-	for object_patch_map_name in ("object_patches", "object_patches_backup"):
-		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
-		if isinstance(object_patch_map, dict) and any(
-			_module_has_target_quantization(module)
-			for module in object_patch_map.values()
-		):
-			return True
+	object_patches = getattr(model_patcher, "object_patches", None)
+	if isinstance(object_patches, dict) and any(
+		_module_has_target_quantization(module)
+		for module in object_patches.values()
+	):
+		return True
+
+	object_patches_backup = getattr(model_patcher, "object_patches_backup", None)
+	if not isinstance(object_patches_backup, dict):
+		object_patches_backup = {}
+	if any(
+		_module_has_target_quantization(module)
+		for module in object_patches_backup.values()
+	):
+		return True
+
+	shadowed_patch_keys = tuple(
+		patch_key
+		for patch_key in object_patches_backup
+		if isinstance(patch_key, str)
+	)
 
 	diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
 	if diffusion_model is None:
 		return False
-	return any(_module_has_target_quantization(module) for module in diffusion_model.modules())
+	for module_name, module in diffusion_model.named_modules():
+		module_patch_key = _module_patch_key(module_name) if module_name else "diffusion_model"
+		if _module_path_is_shadowed(module_patch_key, shadowed_patch_keys):
+			continue
+		if _module_has_target_quantization(module):
+			return True
+	return False
 
 
 def _collect_layer_patch_keys(model_patcher, module_name):
@@ -449,7 +484,7 @@ def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys, bake_deferred=
 
 
 def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_module):
-	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
 		return
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
 
@@ -546,6 +581,7 @@ def _quantize_linear_module(module_name, module, source_weight, quantization_mod
 	weight_work = tensor_to_int8_compute_device(source_weight, compute_device, non_blocking=True)
 	quantization_mode = normalize_quantization_mode(quantization_mode)
 	int4_mode = quantization_mode_is_int4(quantization_mode)
+	w4a8_mode = quantization_mode == QUANTIZATION_MODE_W4A8
 	outlier_method = quantization_mode_outlier_method(quantization_mode)
 
 	if _is_float8_dtype(weight_work.dtype):
@@ -557,6 +593,39 @@ def _quantize_linear_module(module_name, module, source_weight, quantization_mod
 		and weight_work.ndim == 2
 		and weight_work.shape[1] % 256 == 0
 	)
+	if use_int4 and w4a8_mode:
+		q_weight = quantize_native_w4a8(weight_work).to("cpu")
+		q_module = Int8TensorwiseOps.Linear(
+			module.in_features,
+			module.out_features,
+			bias=module.bias is not None,
+			device=torch.device("meta"),
+		)
+		q_module.weight = nn.Parameter(q_weight, requires_grad=False)
+		q_module.weight_scale = None
+		q_module.weight_packed = None
+		q_module.weight_int_mm = None
+		q_module._is_quantized = True
+		q_module._quant_format = W4A8_FORMAT
+		q_module._is_per_row = False
+		q_module._use_quarot = False
+		q_module._outlier_method = OUTLIER_METHOD_NONE
+		q_module._convrot_groupsize = q_weight._params.convrot_groupsize
+		q_module._w4a8_group_size = q_weight._params.group_size
+		q_module.quarot_hadamard = None
+		q_module.hadanorm_sigma = None
+		q_module.compute_dtype = getattr(module, "compute_dtype", torch.bfloat16)
+		q_module.dynamic_lora_entries = None
+		q_module.lora_A = None
+		q_module.lora_B = None
+		q_module.lora_alpha = None
+		if module.bias is not None:
+			q_module.bias = nn.Parameter(module.bias.detach().cpu(), requires_grad=False)
+		else:
+			q_module.bias = None
+		q_module.train(module.training)
+		return q_module, True
+
 	if use_int4:
 		q_weight = quantize_native_int4(weight_work, linear_dtype="int4").to("cpu")
 		q_module = Int8TensorwiseOps.Linear(
@@ -981,7 +1050,7 @@ def _get_int8_patch_weight_scale(q_module):
 def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 	if not _WEIGHT_ADAPTER_AVAILABLE or not isinstance(patch_obj, WeightAdapterBase):
 		return patch_obj, False
-	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
 		return patch_obj, False
 
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
@@ -1053,8 +1122,8 @@ def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 
 
 def _set_existing_int8_weight(q_module, new_weight):
-	if getattr(q_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4":
-		q_module.set_weight(new_weight, seed=comfy.utils.string_to_seed("int4_existing_patch"))
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
+		q_module.set_weight(new_weight, seed=comfy.utils.string_to_seed("low_bit_existing_patch"))
 		return
 	if hasattr(q_module, "_replace_weight"):
 		q_module._replace_weight(new_weight)
@@ -1095,6 +1164,7 @@ def _clone_existing_int8_module(q_module):
 	)
 	cloned_module._convrot_groupsize = getattr(q_module, "_convrot_groupsize", 256)
 	cloned_module._quant_group_size = getattr(q_module, "_quant_group_size", 64)
+	cloned_module._w4a8_group_size = getattr(q_module, "_w4a8_group_size", 16)
 	cloned_module._linear_dtype = getattr(q_module, "_linear_dtype", "int4")
 	cloned_module.quarot_hadamard = (
 		q_module.quarot_hadamard.detach().clone()
@@ -1187,7 +1257,7 @@ def _configure_existing_int8_patches(model_patcher, existing_modules, bake_loade
 				try:
 					work_weight = (
 						target_module.convert_weight(weight.detach().clone())
-						if getattr(target_module, "_quant_format", "int8_tensorwise") == "convrot_w4a4"
+						if getattr(target_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT)
 						else weight.detach().clone()
 					)
 					baked_weight = comfy.lora.calculate_weight(
@@ -1232,7 +1302,7 @@ def _remember_original_linear_modules(model_patcher, candidates):
 	original_module_cache = _get_original_module_cache(model_patcher)
 
 	for module_name, module in candidates:
-		if isinstance(module, Int8TensorwiseOps.Linear):
+		if _module_is_toolkit_quantized(module):
 			continue
 
 		patch_key = _module_patch_key(module_name)
@@ -1241,7 +1311,7 @@ def _remember_original_linear_modules(model_patcher, candidates):
 
 def _clear_prior_int8_object_patches(model_patcher):
 	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
-		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
+		if patch_key.startswith("diffusion_model.") and _module_is_toolkit_quantized(patch_obj):
 			model_patcher.object_patches.pop(patch_key, None)
 
 
@@ -1252,12 +1322,12 @@ def _reset_prior_int8_object_patches(model_patcher):
 	for patch_key, patch_obj in list(model_patcher.object_patches_backup.items()):
 		if not patch_key.startswith("diffusion_model."):
 			continue
-		if isinstance(patch_obj, Int8TensorwiseOps.Linear):
+		if _module_is_toolkit_quantized(patch_obj):
 			continue
 		original_module_cache.setdefault(patch_key, patch_obj)
 
 	for patch_key, patch_obj in list(model_patcher.object_patches.items()):
-		if patch_key.startswith("diffusion_model.") and isinstance(patch_obj, Int8TensorwiseOps.Linear):
+		if patch_key.startswith("diffusion_model.") and _module_is_toolkit_quantized(patch_obj):
 			int8_patch_keys.add(patch_key)
 
 	for patch_key in list(model_patcher.object_patches_backup.keys()):
@@ -1297,11 +1367,11 @@ class INT8ModelAdapter:
 		return {
 			"required": {
 				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to the selected quantization mode."}),
-				"enable_quantization": (QUANTIZATION_CONTROL_CHOICES, {"default": QUANTIZATION_CONTROL_AS_NEEDED, "tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8 or W4A4 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged."}),
+				"enable_quantization": (QUANTIZATION_CONTROL_CHOICES, {"default": QUANTIZATION_CONTROL_AS_NEEDED, "tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, or W4A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged."}),
 				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
-				"quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. Both INT4 modes preserve keep-float layers. int4_mixed keeps a configurable fraction of compatible linears in ConvRot INT8; int4_full uses W4A4 whenever shapes permit."}),
+				"quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 stores 4-bit weights while retaining ConvRot INT8 activations. All low-bit modes preserve keep-float layers."}),
 				"int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
-				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
+				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches on Toolkit W8A8 layers. It does not alter native W4A4 or W4A8 execution. only_small_layers is the default; always can help tiny row counts but often slows larger layers; never forces the INT8 backend."}),
 				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
 				"prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
 				"bake_loaded_loras": ("BOOLEAN", {"default": True, "tooltip": "Apply existing stock LoRA weight patches, including sliced patches, before quantization, then remove the consumed patches to avoid applying them twice. If disabled, layers with pending patches are left unquantized."}),
@@ -1312,7 +1382,7 @@ class INT8ModelAdapter:
 	RETURN_TYPES = ("MODEL",)
 	FUNCTION = "apply_quantization"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to INT8 or native ConvRot INT4. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
+	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to Toolkit W8A8, native ConvRot W4A4, or experimental native W4A8. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
 
 	def apply_quantization(
 		self,
@@ -1347,7 +1417,9 @@ class INT8ModelAdapter:
 			if quantization_mode == QUANTIZATION_MODE_INT4_MIXED
 			else 0.0
 		)
-		if quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+		if quantization_mode == QUANTIZATION_MODE_W4A8 and not native_w4a8_available():
+			raise RuntimeError("W4A8 quantization requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
+		if quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
 			raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
 
 		source_model_patcher = model

@@ -16,6 +16,8 @@ from .int8_lora_patching import (
 	_is_additive_stochastic_patch,
 	_model_has_supported_quantized_modules,
 	_model_has_int4_modules,
+	_model_has_w4a8_modules,
+	NATIVE_REQUANTIZATION_FORMATS,
 	_normalize_lora_source_key,
 	_resolve_target_module_cached,
 	_set_lora_source_key,
@@ -136,7 +138,7 @@ class INT8LoraLoader:
 	def INPUT_TYPES(s):
 		return {
 			"required": {
-				"mode": (LORA_MODE_CHOICES, {"tooltip": "Standard uses ComfyUI's regular MODEL patch path. Stochastic requantizes patched weights and can lose small INT4 deltas. Dynamic applies LoRA deltas at runtime and preserves them for both INT8 and INT4."}),
+				"mode": (LORA_MODE_CHOICES, {"tooltip": "Standard uses ComfyUI's regular MODEL patch path. Stochastic requantizes patched low-bit weights. Dynamic applies runtime deltas to INT8/W4A4 and falls back to Standard with a warning for W4A8."}),
 				"model": ("MODEL", {"tooltip": "Quantized or float diffusion model to receive the LoRA patch."}),
 				"lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "LoRA file from ComfyUI's loras folder."}),
 				"strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "LoRA strength for the diffusion model. Negative values invert the LoRA effect."}),
@@ -146,7 +148,7 @@ class INT8LoraLoader:
 	RETURN_TYPES = ("MODEL",)
 	FUNCTION = "load_lora"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Load one LoRA with format-aware patching for Toolkit INT8 and native ConvRot INT4 models."
+	DESCRIPTION = "Load one LoRA with format-aware patching for Toolkit W8A8, native ConvRot W4A4, and experimental W4A8 models."
 
 	def load_lora(self, mode, model, lora_name, strength, seed=318008):
 		if strength == 0:
@@ -159,6 +161,11 @@ class INT8LoraLoader:
 			logging.warning(
 				"Quantization Toolkit: Stochastic LoRA requantizes INT4 weights and may lose small deltas; "
 				"use Dynamic mode to preserve the LoRA delta at runtime."
+			)
+		if mode == LORA_MODE_STOCHASTIC and _model_has_w4a8_modules(model):
+			logging.warning(
+				"Quantization Toolkit: Stochastic LoRA will requantize W4A8 weights once using "
+				"Comfy-Kitchen's stochastic level assignment; verify quality for very small LoRA strengths."
 			)
 
 		if mode == LORA_MODE_STANDARD:
@@ -204,7 +211,7 @@ class INT8LoraLoaderStack:
 	def INPUT_TYPES(s):
 		inputs = {
 			"required": {
-				"mode": (LORA_MODE_CHOICES, {"tooltip": "Standard uses ComfyUI patching. Stochastic combines and requantizes patched weights, which can lose small INT4 deltas. Dynamic preserves LoRA deltas at runtime for both INT8 and INT4."}),
+				"mode": (LORA_MODE_CHOICES, {"tooltip": "Standard uses ComfyUI patching. Stochastic combines and requantizes patched weights. Dynamic preserves runtime deltas for INT8/W4A4 and falls back to Standard with a warning for W4A8."}),
 				"model": ("MODEL", {"tooltip": "Quantized or float diffusion model to receive the LoRA stack."}),
 			},
 			"optional": {}
@@ -218,7 +225,7 @@ class INT8LoraLoaderStack:
 	RETURN_TYPES = ("MODEL",)
 	FUNCTION = "apply_stack"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Apply a LoRA stack to Toolkit INT8 or native ConvRot INT4 models."
+	DESCRIPTION = "Apply a LoRA stack to Toolkit W8A8, native ConvRot W4A4, and experimental W4A8 models."
 
 	def apply_stack(self, mode, model, seed=318008, **kwargs):
 		lora_entries = _collect_lora_entries(kwargs)
@@ -241,6 +248,11 @@ class INT8LoraLoaderStack:
 			logging.warning(
 				"Quantization Toolkit: Stochastic LoRA stacks requantize INT4 weights and may lose small deltas; "
 				"use Dynamic mode to preserve LoRA deltas at runtime."
+			)
+		if mode == LORA_MODE_STOCHASTIC and _model_has_w4a8_modules(model):
+			logging.warning(
+				"Quantization Toolkit: Stochastic LoRA stacks will requantize W4A8 weights once using "
+				"Comfy-Kitchen's stochastic level assignment; verify quality for very small LoRA strengths."
 			)
 
 		if mode == LORA_MODE_STANDARD:
@@ -308,7 +320,7 @@ class INT8LoraLoaderStack:
 				applied_count += 1
 				if (
 					not _uses_toolkit_quantized_runtime(target_module)
-					or quantization_format == "convrot_w4a4"
+					or quantization_format in NATIVE_REQUANTIZATION_FORMATS
 				):
 					# Native ComfyUI quantized modules aggregate the full patch list
 					# before one requantization. Keep their adapters native so VBAR can
@@ -399,7 +411,7 @@ class QuantizedLoraPatcher(io.ComfyNode):
 					"mode",
 					options=LORA_MODE_CHOICES,
 					default=LORA_MODE_STOCHASTIC,
-					tooltip="Standard uses ComfyUI patching. Stochastic requantizes patched weights. Dynamic preserves LoRA deltas at runtime.",
+					tooltip="Standard uses ComfyUI patching. Stochastic requantizes patched weights. Dynamic preserves runtime deltas on INT8/W4A4 and warns before using Standard fallback on W4A8.",
 				),
 				io.Model.Input("model", tooltip="Quantized or floating-point diffusion model to receive the LoRAs."),
 				io.Autogrow.Input(

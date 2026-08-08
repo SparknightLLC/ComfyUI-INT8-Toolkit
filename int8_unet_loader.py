@@ -12,10 +12,12 @@ from .int8_quant import (
     QUANTIZATION_MODE_CHOICES,
     QUANTIZATION_MODE_INT8,
     QUANTIZATION_MODE_INT4_MIXED,
+    QUANTIZATION_MODE_W4A8,
     normalize_quantization_mode,
     quantization_mode_outlier_method,
     quantization_mode_is_int4,
     native_int4_available,
+    native_w4a8_available,
     SMALL_BATCH_FALLBACK_CHOICES,
     DEFAULT_SMALL_BATCH_FALLBACK,
 )
@@ -198,9 +200,9 @@ class UNetLoaderINTW8A8:
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"], {"tooltip": "Requested source weight dtype passed to ComfyUI during model construction. INT8 checkpoints still load as INT8 when weight_scale tensors are present."}),
                 "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. flux2_fast_unsafe is opt-in and less conservative."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights using the selected mode during loading. Leave off for checkpoints that already contain native quantization metadata."}),
-                "quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. Both INT4 modes preserve keep-float layers. int4_mixed keeps a configurable fraction of compatible linears in ConvRot INT8; int4_full uses W4A4 whenever shapes permit."}),
+                "quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 stores 4-bit weights while retaining ConvRot INT8 activations. All low-bit modes preserve keep-float layers."}),
                 "int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
-                "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
+                "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches on Toolkit W8A8 layers. It does not alter native W4A4 or W4A8 execution. only_small_layers is the default; always can help tiny row counts but often slows larger layers; never forces the INT8 backend."}),
                 "runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
                 "prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
             }
@@ -209,7 +211,7 @@ class UNetLoaderINTW8A8:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "loaders"
-    DESCRIPTION = "Load native mixed INT4/INT8 checkpoints or quantize float and FP8 diffusion models on the fly."
+    DESCRIPTION = "Load native W8A8, W4A4, or experimental W4A8 checkpoints, or quantize float and FP8 diffusion models on the fly."
 
     def load_unet(
         self,
@@ -245,7 +247,9 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.int4_sensitive_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
         quantization_mode = normalize_quantization_mode(quantization_mode)
-        if on_the_fly_quantization and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+        if on_the_fly_quantization and quantization_mode == QUANTIZATION_MODE_W4A8 and not native_w4a8_available():
+            raise RuntimeError("W4A8 quantization requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
+        if on_the_fly_quantization and quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
             raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
         Int8TensorwiseOps.quantization_mode = quantization_mode if on_the_fly_quantization else QUANTIZATION_MODE_INT8
         Int8TensorwiseOps.int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)

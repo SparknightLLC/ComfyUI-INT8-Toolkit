@@ -1,11 +1,11 @@
 # pyproject.toml
 [project]
 name = "comfyui-int8-fast-fork" # Immutable Comfy Registry ID; repository/display names may differ.
-description = "Quantization toolkit for ComfyUI with native INT4/INT8 conversion, mixed-precision loading, LoRA handling, and low-VRAM runtime controls."
-version = "2.1.0"
+description = "Quantization toolkit for ComfyUI with native W4A4, W4A8, and W8A8 conversion, mixed-precision loading, LoRA handling, and low-VRAM runtime controls."
+version = "2.2.0"
 license = { file = "LICENSE" }
 dependencies = []
-keywords = ["comfyui", "quantization", "int4", "int8", "w4a4", "w8a8"]
+keywords = ["comfyui", "quantization", "int4", "int8", "w4a4", "w4a8", "w8a8"]
 
 [project.urls]
 Repository = "https://github.com/SparknightLLC/ComfyUI-QuantizationToolkit"

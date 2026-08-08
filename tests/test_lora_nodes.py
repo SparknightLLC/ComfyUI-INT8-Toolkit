@@ -116,7 +116,7 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 		def load_lora(data, key_map, log_missing=True):
 			return {"diffusion_model.block.weight": adapters[data]}
 
-		for quantization_format in ("int8_tensorwise", "convrot_w4a4"):
+		for quantization_format in ("int8_tensorwise", "convrot_w4a4", "asym_w4a8_int8"):
 			with self.subTest(quantization_format=quantization_format):
 				model = ModelPatcher(quantization_format)
 				loras = {
@@ -286,10 +286,12 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 
 	def test_dynamic_mode_falls_back_to_standard_patches_for_mixed_precision_layers(self):
 		int8_module = SimpleNamespace(quant_format="int8_tensorwise")
+		w4a8_module = SimpleNamespace(quant_format="asym_w4a8_int8")
 		fp8_module = SimpleNamespace(quant_format="float8_e4m3fn")
 		model_patcher = SimpleNamespace(
 			object_patches={
 				"diffusion_model.int8_layer": int8_module,
+				"diffusion_model.w4a8_layer": w4a8_module,
 				"diffusion_model.fp8_layer": fp8_module,
 			},
 			object_patches_backup={},
@@ -298,6 +300,7 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 		fp8_adapter = LoRAAdapter([], (object(), object(), None, None, None, None))
 		patch_dict = {
 			"diffusion_model.int8_layer.weight": int8_adapter,
+			"diffusion_model.w4a8_layer.weight": int8_adapter,
 			"diffusion_model.fp8_layer.weight": fp8_adapter,
 		}
 
@@ -308,7 +311,28 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 		)
 
 		self.assertEqual(dynamic_patches, {"diffusion_model.int8_layer.weight": int8_adapter})
-		self.assertEqual(static_patches, {"diffusion_model.fp8_layer.weight": fp8_adapter})
+		self.assertEqual(
+			static_patches,
+			{
+				"diffusion_model.w4a8_layer.weight": int8_adapter,
+				"diffusion_model.fp8_layer.weight": fp8_adapter,
+			},
+		)
+
+	def test_dynamic_mode_warns_when_w4a8_uses_standard_fallback(self):
+		model_patcher = SimpleNamespace(
+			object_patches={
+				"diffusion_model.block": SimpleNamespace(quant_format="asym_w4a8_int8"),
+			},
+			object_patches_backup={},
+			model=SimpleNamespace(diffusion_model=SimpleNamespace(modules=lambda: ())),
+		)
+
+		with self.assertLogs(level="WARNING") as captured:
+			lora_dynamic._warn_if_w4a8_dynamic_fallback(model_patcher)
+
+		self.assertIn("W4A8 runtime patching is not supported", captured.output[0])
+		self.assertIn("Standard LoRA patch path", captured.output[0])
 
 
 if __name__ == "__main__":

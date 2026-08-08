@@ -51,6 +51,33 @@ class LazyCompileTests(unittest.TestCase):
 
 		self.assertTrue(lazy_compile._has_native_int4_modules(model_patcher))
 
+	def test_w4a8_object_patch_is_detected(self):
+		w4a8_module = torch.nn.Linear(4, 4)
+		w4a8_module._quant_format = "asym_w4a8_int8"
+		model_patcher = SimpleNamespace(
+			object_patches={"diffusion_model.block.linear": w4a8_module},
+			object_patches_backup={},
+			model=SimpleNamespace(diffusion_model=torch.nn.Module()),
+		)
+
+		self.assertTrue(lazy_compile._has_w4a8_modules(model_patcher))
+
+	def test_w4a8_warning_explains_upstream_compile_limitation(self):
+		with mock.patch.object(lazy_compile.importlib.metadata, "version", return_value="0.2.28"):
+			with mock.patch.object(
+				lazy_compile.w4a8_compile_compat,
+				"get_compile_support_error",
+				return_value="test registration failure",
+			):
+				message = lazy_compile._build_w4a8_compile_warning()
+
+		self.assertIn("Installed comfy-kitchen version: 0.2.28", message)
+		self.assertIn("AsymW4A8Int8Layout", message)
+		self.assertIn("torch.library custom operator", message)
+		self.assertIn("FakeTensor implementation", message)
+		self.assertIn("test registration failure", message)
+		self.assertIn("returned uncompiled", message)
+
 	def test_plain_model_is_not_detected_as_int4(self):
 		model_patcher = SimpleNamespace(
 			object_patches={},
@@ -246,6 +273,61 @@ class LazyCompileTests(unittest.TestCase):
 		compile_wrapper = object()
 
 		with mock.patch.object(lazy_compile.int4_compile_compat, "is_compile_supported", return_value=True):
+			with mock.patch.object(lazy_compile, "_make_lazy_compile_wrapper", return_value=compile_wrapper):
+				with mock.patch.object(lazy_compile, "_cleanup_compile_memory"):
+					with mock.patch.object(lazy_compile.logging, "warning") as warning:
+						output = lazy_compile.INT8LazyTorchCompile().apply_lazy_compile(
+							model,
+							backend="inductor",
+							fullgraph=False,
+							mode="default",
+							dynamic_shape_tracing="true",
+							compile_transformer_blocks_only=True,
+							dynamo_cache_size_limit=640,
+							use_guard_filter=True,
+							disable_dynamic_vram=True,
+							verbose=False,
+						)[0]
+
+		wrapper_key = (comfy.patcher_extension.WrappersMP.APPLY_MODEL, lazy_compile._LAZY_COMPILE_WRAPPER_KEY)
+		self.assertIs(output.wrappers[wrapper_key], compile_wrapper)
+		warning.assert_not_called()
+
+	def test_w4a8_uses_lazy_compile_when_compat_is_available(self):
+		class ModelPatcher:
+			def __init__(self, shared_model, w4a8_module):
+				self.model = shared_model
+				self.patches_uuid = "w4a8"
+				self.object_patches = {"diffusion_model.blocks.0.linear": w4a8_module}
+				self.object_patches_backup = {}
+				self.model_options = {"transformer_options": {}}
+				self.wrappers = {}
+
+			def clone(self, disable_dynamic=False):
+				clone = ModelPatcher(self.model, self.object_patches["diffusion_model.blocks.0.linear"])
+				clone.model_options = self.model_options.copy()
+				return clone
+
+			def get_model_object(self, name):
+				if name != "diffusion_model":
+					raise KeyError(name)
+				return self.model.diffusion_model
+
+			def remove_wrappers_with_key(self, wrapper_type, key):
+				self.wrappers.pop((wrapper_type, key), None)
+
+			def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+				self.wrappers[(wrapper_type, key)] = wrapper
+
+		shared_model = nn.Module()
+		shared_model.diffusion_model = nn.Module()
+		shared_model.diffusion_model.blocks = nn.ModuleList([nn.Identity()])
+		w4a8_module = nn.Linear(4, 4)
+		w4a8_module._quant_format = "asym_w4a8_int8"
+		model = ModelPatcher(shared_model, w4a8_module)
+		compile_wrapper = object()
+
+		with mock.patch.object(lazy_compile.w4a8_compile_compat, "is_compile_supported", return_value=True):
 			with mock.patch.object(lazy_compile, "_make_lazy_compile_wrapper", return_value=compile_wrapper):
 				with mock.patch.object(lazy_compile, "_cleanup_compile_memory"):
 					with mock.patch.object(lazy_compile.logging, "warning") as warning:

@@ -104,6 +104,47 @@ class ModelAdapterCacheTests(unittest.TestCase):
 		self.assertEqual(shared_model.diffusion_model.layer.weight.dtype, torch.float16)
 		self.assertEqual(replacement_model_patcher.backup, {})
 
+	def test_as_needed_ignores_quantization_temporarily_installed_by_sibling_patcher(self):
+		shared_model = torch.nn.Module()
+		shared_model.diffusion_model = torch.nn.Module()
+		shared_model.diffusion_model.layer = torch.nn.Linear(4, 4, bias=False)
+		base_model_patcher = ModelPatcher(shared_model, torch.device("cpu"), torch.device("cpu"))
+		quantized_model_patcher = base_model_patcher.clone()
+		quantized_module = torch.nn.Linear(4, 4, bias=False)
+		quantized_module._is_quantized = True
+		quantized_module._quant_format = "asym_w4a8_int8"
+		quantized_model_patcher.add_object_patch("diffusion_model.layer", quantized_module)
+		quantized_model_patcher.patch_model(load_weights=False)
+
+		self.assertIs(shared_model.diffusion_model.layer, quantized_module)
+		self.assertTrue(model_adapter._model_has_quantized_modules(quantized_model_patcher))
+		self.assertFalse(model_adapter._model_has_quantized_modules(base_model_patcher))
+
+	def test_as_needed_recognizes_quantized_underlying_module_while_object_patch_is_active(self):
+		shared_model = torch.nn.Module()
+		shared_model.diffusion_model = torch.nn.Module()
+		quantized_module = torch.nn.Linear(4, 4, bias=False)
+		quantized_module.quant_format = "int8_tensorwise"
+		shared_model.diffusion_model.layer = quantized_module
+		base_model_patcher = ModelPatcher(shared_model, torch.device("cpu"), torch.device("cpu"))
+		patched_model_patcher = base_model_patcher.clone()
+		patched_model_patcher.add_object_patch("diffusion_model.layer", torch.nn.Identity())
+		patched_model_patcher.patch_model(load_weights=False)
+
+		self.assertTrue(model_adapter._model_has_quantized_modules(base_model_patcher))
+
+	def test_stale_toolkit_class_identity_does_not_block_object_patch_cleanup(self):
+		stale_quantized_module = torch.nn.Linear(4, 4, bias=False)
+		stale_quantized_module._is_quantized = True
+		stale_quantized_module._quant_format = "asym_w4a8_int8"
+		model_patcher = SimpleNamespace(
+			object_patches={"diffusion_model.layer": stale_quantized_module},
+		)
+
+		model_adapter._clear_prior_int8_object_patches(model_patcher)
+
+		self.assertEqual(model_patcher.object_patches, {})
+
 	def test_prior_adapter_reset_fully_unpatches_weights(self):
 		quantized_module = model_adapter.Int8TensorwiseOps.Linear(4, 4, bias=False)
 		original_module = torch.nn.Linear(4, 4, bias=False)
