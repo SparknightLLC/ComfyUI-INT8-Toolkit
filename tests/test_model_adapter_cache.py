@@ -1,4 +1,5 @@
 import importlib
+import gc
 import sys
 import unittest
 import weakref
@@ -43,6 +44,24 @@ class ModelAdapterCacheTests(unittest.TestCase):
 
 		self.assertIsNot(first_cache, second_cache)
 
+	def test_output_cache_does_not_retain_base_model(self):
+		class CachedOutput:
+			pass
+
+		shared_model = torch.nn.Module()
+		cached_output = CachedOutput()
+		cached_output.model = shared_model
+		model_adapter._remember_cached_output(shared_model, ("output",), cached_output)
+		shared_model_ref = weakref.ref(shared_model)
+		cached_output_ref = weakref.ref(cached_output)
+
+		del cached_output
+		del shared_model
+		gc.collect()
+
+		self.assertIsNone(cached_output_ref())
+		self.assertIsNone(shared_model_ref())
+
 	def test_architecture_change_clears_prior_adapter_output(self):
 		first_model = torch.nn.Module()
 		second_model = torch.nn.Module()
@@ -55,6 +74,35 @@ class ModelAdapterCacheTests(unittest.TestCase):
 		with mock.patch.object(model_adapter, "_cleanup_adapter_cache_memory") as cleanup_memory:
 			model_adapter._prepare_model_cache(second_model)
 
+		self.assertEqual(first_cache, {})
+		cached_model_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True)
+		cleanup_memory.assert_called_once_with()
+
+	def test_as_needed_prequantized_model_still_cleans_prior_model_cache(self):
+		first_model = torch.nn.Module()
+		first_cache = model_adapter._get_output_cache(first_model)
+		cached_model_patcher = mock.Mock()
+		first_cache[("first",)] = cached_model_patcher
+		model_adapter._INT8_MODEL_ADAPTER_LAST_MODEL_REF = weakref.ref(first_model)
+		model_adapter._INT8_MODEL_ADAPTER_LAST_MODEL_ID = id(first_model)
+
+		second_model = torch.nn.Module()
+		second_model.diffusion_model = torch.nn.Module()
+		quantized_module = torch.nn.Linear(4, 4, bias=False)
+		quantized_module.quant_format = "int8_tensorwise"
+		second_model.diffusion_model.layer = quantized_module
+		second_model_patcher = ModelPatcher(second_model, torch.device("cpu"), torch.device("cpu"))
+
+		with mock.patch.object(model_adapter, "_cleanup_adapter_cache_memory") as cleanup_memory:
+			output = model_adapter.INT8ModelAdapter().apply_quantization(
+				second_model_patcher,
+				enable_quantization=model_adapter.QUANTIZATION_CONTROL_AS_NEEDED,
+				model_type="auto",
+				quantization_mode="int8_convrot",
+				log_progress=False,
+			)[0]
+
+		self.assertIs(output, second_model_patcher)
 		self.assertEqual(first_cache, {})
 		cached_model_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True)
 		cleanup_memory.assert_called_once_with()

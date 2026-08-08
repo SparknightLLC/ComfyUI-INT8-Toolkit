@@ -1,5 +1,6 @@
 import functools
 import importlib
+import gc
 import sys
 import unittest
 import weakref
@@ -357,6 +358,24 @@ class LazyCompileTests(unittest.TestCase):
 
 		self.assertIsNot(first_cache, second_cache)
 
+	def test_output_cache_does_not_retain_base_model(self):
+		class CachedOutput:
+			pass
+
+		shared_model = torch.nn.Module()
+		cached_output = CachedOutput()
+		cached_output.model = shared_model
+		lazy_compile._remember_cached_output(shared_model, ("output",), cached_output)
+		shared_model_ref = weakref.ref(shared_model)
+		cached_output_ref = weakref.ref(cached_output)
+
+		del cached_output
+		del shared_model
+		gc.collect()
+
+		self.assertIsNone(cached_output_ref())
+		self.assertIsNone(shared_model_ref())
+
 	def test_structure_caches_are_local_to_each_base_model(self):
 		first_model = torch.nn.Module()
 		second_model = torch.nn.Module()
@@ -437,8 +456,8 @@ class LazyCompileTests(unittest.TestCase):
 
 	def test_same_model_eviction_preserves_dynamo_cache(self):
 		shared_model = torch.nn.Module()
-		first_output = SimpleNamespace()
-		second_output = SimpleNamespace()
+		first_output = mock.Mock()
+		second_output = mock.Mock()
 
 		with mock.patch.object(lazy_compile, "_dispose_cached_output") as dispose_output:
 			with mock.patch.object(lazy_compile, "_cleanup_compile_memory") as cleanup_memory:

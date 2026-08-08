@@ -923,6 +923,9 @@ def _cleanup_adapter_cache_memory():
 
 
 def _dispose_cached_adapter_output(model_patcher):
+	model_patcher = _resolve_cached_adapter_output(model_patcher)
+	if model_patcher is None:
+		return
 	unpatch_model = getattr(model_patcher, "unpatch_model", None)
 	if not callable(unpatch_model):
 		return
@@ -930,6 +933,18 @@ def _dispose_cached_adapter_output(model_patcher):
 		unpatch_model(unpatch_weights=True)
 	except Exception as e:
 		logging.warning(f"Quantization Model Adapter: failed to unpatch an evicted cached output ({e}).")
+
+
+def _resolve_cached_adapter_output(cached_output):
+	if isinstance(cached_output, weakref.ReferenceType):
+		return cached_output()
+	return cached_output
+
+
+def _prune_dead_adapter_outputs(cache):
+	for cache_key, cached_output in list(cache.items()):
+		if _resolve_cached_adapter_output(cached_output) is None:
+			cache.pop(cache_key, None)
 
 
 def _prepare_model_cache(shared_model):
@@ -942,8 +957,10 @@ def _prepare_model_cache(shared_model):
 		if prior_model is not None:
 			prior_cache = getattr(prior_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, None)
 			if isinstance(prior_cache, dict):
-				for cached_model_patcher in prior_cache.values():
-					_dispose_cached_adapter_output(cached_model_patcher)
+				for cached_output in prior_cache.values():
+					cached_model_patcher = _resolve_cached_adapter_output(cached_output)
+					if cached_model_patcher is not None:
+						_dispose_cached_adapter_output(cached_model_patcher)
 				prior_cache.clear()
 		_cleanup_adapter_cache_memory()
 
@@ -997,12 +1014,15 @@ def _apply_int8_runtime_settings(small_batch_fallback, runtime_backend, prepack_
 
 def _remember_cached_output(shared_model, cache_key, model_patcher):
 	cache = _get_output_cache(shared_model)
-	cache[cache_key] = model_patcher
+	_prune_dead_adapter_outputs(cache)
+	cache[cache_key] = weakref.ref(model_patcher)
 	while len(cache) > _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT:
 		old_key = next(iter(cache))
 		if old_key == cache_key and len(cache) > 1:
 			old_key = next(key for key in cache if key != cache_key)
-		_dispose_cached_adapter_output(cache.pop(old_key))
+		cached_model_patcher = _resolve_cached_adapter_output(cache.pop(old_key))
+		if cached_model_patcher is not None:
+			_dispose_cached_adapter_output(cached_model_patcher)
 	_cleanup_adapter_cache_memory()
 
 
@@ -1010,9 +1030,12 @@ def _make_output_cache_room(cache):
 	if _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT <= 0:
 		return
 
+	_prune_dead_adapter_outputs(cache)
 	evicted = False
 	while len(cache) >= _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT:
-		_dispose_cached_adapter_output(cache.pop(next(iter(cache))))
+		cached_model_patcher = _resolve_cached_adapter_output(cache.pop(next(iter(cache))))
+		if cached_model_patcher is not None:
+			_dispose_cached_adapter_output(cached_model_patcher)
 		evicted = True
 	if evicted:
 		_cleanup_adapter_cache_memory()
@@ -1402,13 +1425,15 @@ class INT8ModelAdapter:
 			raise ValueError(f"Invalid enable_quantization value {enable_quantization}")
 		if enable_quantization == QUANTIZATION_CONTROL_BYPASS:
 			return (model,)
-		if (
-			enable_quantization == QUANTIZATION_CONTROL_AS_NEEDED
-			and _model_has_quantized_modules(model)
-		):
-			if log_progress:
-				logging.info("Quantization Model Adapter: input MODEL is already quantized; returning it unchanged.")
-			return (model,)
+
+		source_model_patcher = model
+		output_cache = None
+		if enable_quantization == QUANTIZATION_CONTROL_AS_NEEDED:
+			output_cache = _prepare_model_cache(source_model_patcher.model)
+			if _model_has_quantized_modules(model):
+				if log_progress:
+					logging.info("Quantization Model Adapter: input MODEL is already quantized; returning it unchanged.")
+				return (model,)
 
 		quantization_mode = normalize_quantization_mode(quantization_mode)
 		int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)
@@ -1421,9 +1446,9 @@ class INT8ModelAdapter:
 			raise RuntimeError("W4A8 quantization requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
 		if quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
 			raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
+		if output_cache is None:
+			output_cache = _prepare_model_cache(source_model_patcher.model)
 
-		source_model_patcher = model
-		output_cache = _prepare_model_cache(source_model_patcher.model)
 		source_diffusion_model = getattr(source_model_patcher.model, "diffusion_model", None)
 		if source_diffusion_model is None:
 			logging.warning("Quantization Model Adapter: model has no diffusion_model; returning unchanged model.")
@@ -1468,11 +1493,12 @@ class INT8ModelAdapter:
 			lora_signature,
 		)
 		if use_output_cache:
-			cached_model_patcher = output_cache.get(adapter_cache_key)
+			cached_model_patcher = _resolve_cached_adapter_output(output_cache.get(adapter_cache_key))
 			if cached_model_patcher is not None:
 				if log_progress:
 					logging.info("Quantization Model Adapter: reusing cached MODEL output.")
 				return (cached_model_patcher,)
+			output_cache.pop(adapter_cache_key, None)
 			_make_output_cache_room(output_cache)
 
 		model_patcher = source_model_patcher.clone()

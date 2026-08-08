@@ -525,6 +525,9 @@ def _cleanup_compile_memory(reset_compile_cache=False):
 
 
 def _dispose_cached_output(model_patcher):
+	model_patcher = _resolve_cached_output(model_patcher)
+	if model_patcher is None:
+		return
 	try:
 		model_patcher.remove_wrappers_with_key(
 			comfy.patcher_extension.WrappersMP.APPLY_MODEL,
@@ -536,6 +539,18 @@ def _dispose_cached_output(model_patcher):
 		model_patcher.model_options.pop(_TORCH_COMPILE_KWARGS, None)
 	except Exception:
 		pass
+
+
+def _resolve_cached_output(cached_output):
+	if isinstance(cached_output, weakref.ReferenceType):
+		return cached_output()
+	return cached_output
+
+
+def _prune_dead_outputs(cache):
+	for cache_key, cached_output in list(cache.items()):
+		if _resolve_cached_output(cached_output) is None:
+			cache.pop(cache_key, None)
 
 
 def _make_model_ref(shared_model):
@@ -555,8 +570,10 @@ def _prepare_model_cache(shared_model):
 		if prior_model is not None:
 			prior_cache = getattr(prior_model, _LAZY_COMPILE_OUTPUT_CACHE_KEY, None)
 			if isinstance(prior_cache, dict):
-				for cached_model_patcher in list(prior_cache.values()):
-					_dispose_cached_output(cached_model_patcher)
+				for cached_output in list(prior_cache.values()):
+					cached_model_patcher = _resolve_cached_output(cached_output)
+					if cached_model_patcher is not None:
+						_dispose_cached_output(cached_model_patcher)
 				prior_cache.clear()
 			prior_structure_cache = getattr(prior_model, _LAZY_COMPILE_STRUCTURE_CACHE_KEY, None)
 			if isinstance(prior_structure_cache, dict):
@@ -573,13 +590,15 @@ def _remember_cached_output(shared_model, cache_key, model_patcher):
 		return
 
 	cache = _get_output_cache(shared_model)
-	cache[cache_key] = model_patcher
+	_prune_dead_outputs(cache)
+	cache[cache_key] = weakref.ref(model_patcher)
 	while len(cache) > _LAZY_COMPILE_OUTPUT_CACHE_LIMIT:
 		old_key = next(iter(cache))
 		if old_key == cache_key and len(cache) > 1:
 			old_key = next(key for key in cache if key != cache_key)
-		evicted_model_patcher = cache.pop(old_key)
-		if evicted_model_patcher is not model_patcher:
+		evicted_output = cache.pop(old_key)
+		evicted_model_patcher = _resolve_cached_output(evicted_output)
+		if evicted_model_patcher is not None and evicted_model_patcher is not model_patcher:
 			_dispose_cached_output(evicted_model_patcher)
 	_cleanup_compile_memory(reset_compile_cache=False)
 
@@ -588,11 +607,13 @@ def _make_output_cache_room(cache):
 	if _LAZY_COMPILE_OUTPUT_CACHE_LIMIT <= 0:
 		return
 
+	_prune_dead_outputs(cache)
 	evicted = False
 	while len(cache) >= _LAZY_COMPILE_OUTPUT_CACHE_LIMIT:
 		old_key = next(iter(cache))
-		evicted_model_patcher = cache.pop(old_key)
-		_dispose_cached_output(evicted_model_patcher)
+		evicted_model_patcher = _resolve_cached_output(cache.pop(old_key))
+		if evicted_model_patcher is not None:
+			_dispose_cached_output(evicted_model_patcher)
 		evicted = True
 	if evicted:
 		_cleanup_compile_memory(reset_compile_cache=False)
@@ -801,9 +822,10 @@ class INT8LazyTorchCompile:
 			verbose,
 		)
 		if _LAZY_COMPILE_OUTPUT_CACHE_LIMIT > 0:
-			cached_model_patcher = output_cache.get(cache_key)
+			cached_model_patcher = _resolve_cached_output(output_cache.get(cache_key))
 			if cached_model_patcher is not None:
 				return (cached_model_patcher,)
+			output_cache.pop(cache_key, None)
 			_make_output_cache_room(output_cache)
 
 		if not disable_dynamic_vram and callable(getattr(model, "is_dynamic", None)) and model.is_dynamic():

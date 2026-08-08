@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.2.0 - 8 August 2026</summary>
+<details open><summary>2.2.1 - 8 August 2026</summary>
+
+### Fixed
+
+- Made adapter and lazy-compile output caches weakly reference their MODEL outputs so ComfyUI can release the previous quantized model before mapping a replacement checkpoint. Already-quantized `as_needed` inputs now also run architecture-transition cleanup before returning unchanged.
+
+</details>
+
+<details><summary>2.2.0 - 8 August 2026</summary>
 
 ### Added
 
