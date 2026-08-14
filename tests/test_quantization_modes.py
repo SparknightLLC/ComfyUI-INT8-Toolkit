@@ -87,6 +87,36 @@ class QuantizationModeTests(unittest.TestCase):
 		).to(base_output.dtype)
 		torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
+	def test_linear_cast_cleanup_runs_when_execution_raises(self):
+		for quant_format, kernel_owner, kernel_name in (
+			(None, quant.F, "linear"),
+			("convrot_w4a4", quant, "native_int4_linear"),
+			(quant.W4A8_FORMAT, quant, "native_w4a8_linear"),
+		):
+			with self.subTest(quant_format=quant_format or "float"):
+				module = quant.Int8TensorwiseOps.Linear(4, 3, bias=False, device="cpu", dtype=torch.float32)
+				module._is_quantized = quant_format is not None
+				module._quant_format = quant_format
+				offload_stream = object()
+
+				with mock.patch(
+					"comfy.ops.cast_bias_weight",
+					return_value=(module.weight, module.bias, offload_stream),
+				), mock.patch("comfy.ops.uncast_bias_weight") as uncast_bias_weight, mock.patch.object(
+					kernel_owner,
+					kernel_name,
+					side_effect=RuntimeError("execution failed"),
+				):
+					with self.assertRaisesRegex(RuntimeError, "execution failed"):
+						module(torch.randn(2, 4, dtype=torch.float32))
+
+				uncast_bias_weight.assert_called_once_with(
+					module,
+					module.weight,
+					module.bias,
+					offload_stream,
+				)
+
 	def test_native_int8_convrot_metadata_round_trip_preserves_layer_group_size(self):
 		state_dict = {
 			"weight": torch.randint(-8, 9, (16, 2688), dtype=torch.int8),
@@ -336,7 +366,7 @@ class QuantizationModeTests(unittest.TestCase):
 
 	def test_model_adapter_rejects_w4a8_without_native_layout(self):
 		with mock.patch.object(model_adapter, "native_w4a8_available", return_value=False):
-			with self.assertRaisesRegex(RuntimeError, "ComfyUI 0.31.0 or newer"):
+			with self.assertRaisesRegex(RuntimeError, "ComfyUI 0.32.0 or newer"):
 				model_adapter.INT8ModelAdapter().apply_quantization(
 					object(),
 					enable_quantization=model_adapter.QUANTIZATION_CONTROL_ALWAYS,

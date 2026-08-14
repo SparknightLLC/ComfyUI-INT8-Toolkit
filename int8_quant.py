@@ -326,7 +326,7 @@ def _make_native_w4a8_tensor(
     convrot_groupsize=_CONVROT_GROUP_SIZE,
 ):
     if not _NATIVE_W4A8_AVAILABLE:
-        raise RuntimeError("W4A8 requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
+        raise RuntimeError("W4A8 requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
 
     if not isinstance(qdata, torch.Tensor) or qdata.dtype != torch.int8:
         raise ValueError("W4A8 requires a packed INT8 weight tensor")
@@ -361,7 +361,7 @@ def _make_native_w4a8_tensor(
 
 def quantize_native_w4a8(weight, stochastic_rounding=0):
     if not _NATIVE_W4A8_AVAILABLE:
-        raise RuntimeError("W4A8 requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
+        raise RuntimeError("W4A8 requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
     if weight.ndim != 2:
         raise ValueError("W4A8 requires a two-dimensional weight")
     if weight.shape[1] % _CONVROT_GROUP_SIZE != 0:
@@ -2025,10 +2025,10 @@ class DynamicLoRAHook:
 # =============================================================================
 
 try:
-    from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
+    from comfy.ops import manual_cast, CastBiasWeightContext
     _COMFY_OPS_AVAILABLE = True
-except ImportError:
-    _COMFY_OPS_AVAILABLE = False
+except ImportError as error:
+    raise ImportError("ComfyUI Quantization Toolkit requires ComfyUI 0.32.0 or newer") from error
 
 
 if _COMFY_OPS_AVAILABLE:
@@ -2732,13 +2732,11 @@ if _COMFY_OPS_AVAILABLE:
                 """Fast forward using torch._int_mm for quantized weights."""
                 
                 if not self._is_quantized:
-                    weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
-                    out = F.linear(x, weight, bias)
-                    uncast_bias_weight(self, weight, bias, offload_stream)
-                    return out
+                    with CastBiasWeightContext(self, x, offloadable=True) as (weight, bias):
+                        return F.linear(x, weight, bias)
 
                 if self._quant_format == "convrot_w4a4":
-                    weight, bias, offload_stream = cast_bias_weight(
+                    with CastBiasWeightContext(
                         self,
                         input=None,
                         dtype=self.weight.dtype,
@@ -2747,9 +2745,8 @@ if _COMFY_OPS_AVAILABLE:
                         offloadable=True,
                         compute_dtype=x.dtype,
                         want_requant=True,
-                    )
-                    out = native_int4_linear(x, weight, bias)
-                    uncast_bias_weight(self, weight, bias, offload_stream)
+                    ) as (weight, bias):
+                        out = native_int4_linear(x, weight, bias)
                     return apply_dynamic_lora_delta(
                         x_input=x,
                         y=out,
@@ -2761,7 +2758,7 @@ if _COMFY_OPS_AVAILABLE:
                     )
 
                 if self._quant_format == _W4A8_FORMAT:
-                    weight, bias, offload_stream = cast_bias_weight(
+                    with CastBiasWeightContext(
                         self,
                         input=None,
                         dtype=self.weight.dtype,
@@ -2770,10 +2767,8 @@ if _COMFY_OPS_AVAILABLE:
                         offloadable=True,
                         compute_dtype=x.dtype,
                         want_requant=True,
-                    )
-                    out = native_w4a8_linear(x, weight, bias)
-                    uncast_bias_weight(self, weight, bias, offload_stream)
-                    return out
+                    ) as (weight, bias):
+                        return native_w4a8_linear(x, weight, bias)
                 
                 # 1. Move weight/bias/scale to device (non_blocking)
                 weight = self.weight if self.weight.device == x.device else self.weight.to(x.device, non_blocking=True)

@@ -2,7 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.2.1 - 8 August 2026</summary>
+<details open><summary>2.2.2 - 13 August 2026</summary>
+
+### Changed
+
+- Raised the minimum supported ComfyUI version to 0.32.0.
+
+### Fixed
+
+- Adopted ComfyUI's context-managed weight casting for floating-point, W4A4, and W4A8 linear execution so Dynamic VRAM offload cleanup still runs when inference raises an exception.
+
+</details>
+
+<details><summary>2.2.1 - 8 August 2026</summary>
 
 ### Fixed
 

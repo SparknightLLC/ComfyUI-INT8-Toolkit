@@ -248,7 +248,7 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
         quantization_mode = normalize_quantization_mode(quantization_mode)
         if on_the_fly_quantization and quantization_mode == QUANTIZATION_MODE_W4A8 and not native_w4a8_available():
-            raise RuntimeError("W4A8 quantization requires ComfyUI 0.31.0 or newer with a compatible comfy-kitchen installation")
+            raise RuntimeError("W4A8 quantization requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
         if on_the_fly_quantization and quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
             raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
         Int8TensorwiseOps.quantization_mode = quantization_mode if on_the_fly_quantization else QUANTIZATION_MODE_INT8

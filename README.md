@@ -27,7 +27,7 @@ Restart ComfyUI after installation or updates.
 
 ### Requirements
 
-- A recent ComfyUI version with native quantization support. Experimental W4A8 requires ComfyUI 0.31.0 or newer.
+- ComfyUI 0.32.0 or newer.
 - A compatible `comfy-kitchen`; W4A4 uses `TensorCoreConvRotW4A4Layout` and W4A8 uses `AsymW4A8Int8Layout`.
 - An NVIDIA GPU with useful INT8 throughput.
 - A PyTorch/CUDA environment supported by your ComfyUI installation.
